@@ -105,6 +105,8 @@ public:
 
     void setDefaultDatabase(const String & database) override;
 
+    void setCancelCallback(std::function<bool()> callback) override { is_cancelled_callback = std::move(callback); }
+
     void getServerVersion(const ConnectionTimeouts & timeouts,
                           String & name,
                           UInt64 & version_major,
@@ -163,20 +165,12 @@ public:
 
     void setThrottler(const ThrottlerPtr &) override {}
 
-    const Progress & getCHDBProgress() const { return chdb_progress; }
-#if USE_PYTHON
-    void resetQueryContext();
-    Session & getSession() const { return *session; }
-#endif
-
 private:
     bool pullBlock(Block & block);
 
     void finishQuery();
 
     void updateProgress(const Progress & value);
-
-    void updateCHDBProgress(const Progress & value);
 
     void sendProfileEvents();
 
@@ -192,11 +186,12 @@ private:
     bool send_progress;
     bool send_profile_events;
     String server_display_name;
+    /// Optional callback to check if the query was cancelled (e.g. via Ctrl+C).
+    /// Set by the client application; used as `interactive_cancel_callback` on the query context.
+    std::function<bool()> is_cancelled_callback;
     String description = "clickhouse-local";
 
     std::optional<LocalQueryState> state;
-
-    Progress chdb_progress;
 
     /// Last "server" packet.
     std::optional<UInt64> next_packet_type;

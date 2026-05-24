@@ -60,12 +60,16 @@ void interruptSignalHandler(int signum)
 
 ClientApplicationBase::~ClientApplicationBase()
 {
-    /// Signal handlers and the listener thread are managed globally via the
-    /// static HandledSignals singleton.  In the chDB embedded use-case a new
-    /// ClientApplicationBase is created (and destroyed) for every query, but
-    /// the signal infrastructure must survive across queries.  Cleanup is
-    /// handled by chdb_reset_signal_handlers() / set_signal_handlers_enabled(0)
-    /// when the user explicitly requests it.
+    try
+    {
+        writeSignalIDtoSignalPipe(SignalListener::StopThread);
+        signal_listener_thread.join();
+        HandledSignals::instance().reset();
+    }
+    catch (...)
+    {
+        tryLogCurrentException(__PRETTY_FUNCTION__);
+    }
 }
 
 ClientApplicationBase::ClientApplicationBase() : ClientBase(STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO, std::cin, std::cout, std::cerr) {}
@@ -156,6 +160,15 @@ void ClientApplicationBase::init(int argc, char ** argv)
 
     if (argc)
         argv0 = argv[0];
+
+    /// Set application name for help messages based on how the binary was invoked
+    std::string_view argv0_view(argv0 ? argv0 : "");
+    std::string name_with_dash = "clickhouse-" + getName();
+    if (argv0_view.find(name_with_dash) != std::string_view::npos)
+        app_name = name_with_dash;
+    else
+        app_name = "clickhouse " + getName();
+
     readArguments(argc, argv, common_arguments, external_tables_arguments, hosts_and_ports_arguments);
 
     /// Support for Unicode dashes
@@ -254,16 +267,9 @@ void ClientApplicationBase::init(int argc, char ** argv)
         fatal_channel_ptr->addChannel(fatal_file_channel_ptr);
     }
 
-    /// chDB: create loggers for once
-    static std::once_flag once;
-    std::call_once(
-        once,
-        [this]()
-        {
-            fatal_log = createLogger("ClientBase", fatal_channel_ptr.get(), Poco::Message::PRIO_FATAL);
-            signal_listener = std::make_unique<SignalListener>(nullptr, fatal_log);
-            signal_listener_thread.start(*signal_listener);
-        });
+    fatal_log = createLogger("ClientBase", fatal_channel_ptr.get(), Poco::Message::PRIO_FATAL);
+    signal_listener = std::make_unique<SignalListener>(nullptr, fatal_log);
+    signal_listener_thread.start(*signal_listener);
 }
 
 

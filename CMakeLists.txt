@@ -33,13 +33,6 @@ endif()
 
 include (cmake/arch.cmake)
 include (cmake/target.cmake)
-
-if (NOT OS_DARWIN)
-    set(CMAKE_CXX_VISIBILITY_PRESET hidden)
-    set(CMAKE_C_VISIBILITY_PRESET hidden)
-    set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
-endif()
-
 include (cmake/tools.cmake)
 include (cmake/ccache.cmake)
 include (cmake/clang_tidy.cmake)
@@ -109,11 +102,6 @@ if (ENABLE_BUZZHOUSE)
     set (ENABLE_PROTOBUF 1)
 endif()
 
-if (ENABLE_PYTHON)
-    set(USE_PYTHON 1)
-    set(USE_UTF8PROC 1)
-endif()
-
 option (ENABLE_XRAY "Enable LLVM XRay" ON)
 
 if (NOT ENABLE_XRAY)
@@ -147,16 +135,14 @@ if (ENABLE_COLORED_BUILD AND CMAKE_GENERATOR STREQUAL "Ninja")
     # --> available since CMake 3.24: https://stackoverflow.com/a/73349744
 endif ()
 
-include (cmake/check_flags.cmake)
 include (cmake/add_warning.cmake)
 
-if (USE_MUSL)
-    add_definitions(-DUSE_MUSL=1 -D__MUSL__=1)
-    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ftls-model=global-dynamic")
-    set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -ftls-model=global-dynamic")
-endif()
+# Block build-time CMake probes (check_*, try_compile, try_run) project-wide. Compiler and
+# toolchain are fixed (see cmake/tools.cmake), so feature detection is unnecessary - any
+# version-dependent behaviour must be gated on CMAKE_CXX_COMPILER_VERSION explicitly.
+include (cmake/block_build_time_checks.cmake)
 
-option(ENABLE_TESTS "Provide unit_test_dbms target with Google.Test unit tests" ON)
+option(ENABLE_TESTS "Provide unit_tests_dbms target with Google.Test unit tests" ON)
 option(ENABLE_EXAMPLES "Build all example programs in 'examples' subdirectories" OFF)
 option(ENABLE_BENCHMARKS "Build all benchmark programs in 'benchmarks' subdirectories" OFF)
 
@@ -172,9 +158,23 @@ if (OS_LINUX)
     # - The main clickhouse binary does not use dlopen,
     #   and whatever is poisoning it by LD_PRELOAD should not link to our symbols.
     set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--no-export-dynamic -Wl,--gc-sections")
+
+    if (LINKER_NAME MATCHES "lld" AND NOT SANITIZE AND NOT SANITIZE_COVERAGE AND NOT WITH_COVERAGE)
+        # Fold identical code and data sections to reduce binary size.
+        set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--icf=all")
+    endif ()
+
+    # In Release builds, strip residual debug sections that may come from contrib
+    # libraries or Rust crates compiled with debug info by their own build systems.
+    if (CMAKE_BUILD_TYPE_UC STREQUAL "RELEASE" AND NOT SPLIT_DEBUG_SYMBOLS)
+        set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--strip-debug")
+    endif ()
 endif ()
 
 if (OS_DARWIN)
+    # Remove unreachable functions/data (Darwin equivalent of --gc-sections).
+    set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-dead_strip")
+
     # The `-all_load` flag forces loading of all symbols from all libraries,
     # and leads to multiply-defined symbols. This flag allows force loading
     # from a _specific_ library, which is what we need.
@@ -196,7 +196,9 @@ else()
 endif()
 # Provides faster linking and lower binary size.
 # Tradeoff is the inability to debug some source files with e.g. gdb
-# (empty stack frames and no local variables)."
+# (empty stack frames and no local variables).
+# In Release builds (which have no debug info by default), this option has
+# no effect -- it only reduces debug info for RelWithDebInfo and MinSizeRel.
 option(OMIT_HEAVY_DEBUG_SYMBOLS
     "Do not generate debugger info for heavy modules (ClickHouse functions and dictionaries, some contrib)"
     ${OMIT_HEAVY_DEBUG_SYMBOLS_DEFAULT})
@@ -205,8 +207,9 @@ option(BUILD_STANDALONE_KEEPER "Build keeper as small standalone binary" OFF)
 
 # Create BuildID when using lld. For other linkers it is created by default.
 # (NOTE: LINKER_NAME can be either path or name, and in different variants)
-if (LINKER_NAME MATCHES "lld")
+if (LINKER_NAME MATCHES "lld" AND NOT LINKER_NAME MATCHES "ld64")
     # SHA1 is not cryptographically secure but it is the best what lld is offering.
+    # ld64.lld (MachO linker) does not support --build-id.
     set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--build-id=sha1")
 endif ()
 
@@ -272,8 +275,11 @@ endif()
 option (ENABLE_BUILD_PATH_MAPPING "Enable remapping of file source paths in debug info, predefined preprocessor macros, and __builtin_FILE(). It's used to generate reproducible builds. See https://reproducible-builds.org/docs/build-path" ${ENABLE_BUILD_PATH_MAPPING_DEFAULT})
 
 if (ENABLE_BUILD_PATH_MAPPING)
-    set (COMPILER_FLAGS "${COMPILER_FLAGS} -ffile-prefix-map=${PROJECT_SOURCE_DIR}=.")
-    set (CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -ffile-prefix-map=${PROJECT_SOURCE_DIR}=.")
+    # Fix DW_AT_comp_dir to "." regardless of the build directory location, then strip the source
+    # directory prefix from all file paths (trailing slash ensures the separator is stripped too,
+    # leaving bare relative paths like "src/Foo.cpp" that the symbolizer resolves to "./src/Foo.cpp").
+    set (COMPILER_FLAGS "${COMPILER_FLAGS} -fdebug-compilation-dir=. -ffile-prefix-map=${PROJECT_SOURCE_DIR}/=")
+    set (CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -fdebug-compilation-dir=. -ffile-prefix-map=${PROJECT_SOURCE_DIR}/=")
 endif ()
 
 option (ENABLE_BUILD_PROFILING "Enable profiling of build time" OFF)
@@ -294,8 +300,25 @@ set (CMAKE_C_STANDARD 11)
 set (CMAKE_C_EXTENSIONS ON) # required by most contribs written in C
 set (CMAKE_C_STANDARD_REQUIRED ON)
 
-# falign-functions=64 prevents from random performance regressions with the code change. Thus, providing more stable benchmarks.
-set(COMPILER_FLAGS "${COMPILER_FLAGS} -falign-functions=64")
+# Align functions and loops to reduce performance sensitivity to code layout changes,
+# providing more stable benchmarks.
+set(COMPILER_FLAGS "${COMPILER_FLAGS} -falign-functions=64 -falign-loops=32")
+
+# Put each function and data item into its own section so that the linker can
+# remove unused ones (--gc-sections / -dead_strip) and fold identical ones (--icf).
+# Sanitizer and coverage builds do not benefit from these size optimizations
+# and the extra sections hurt instruction-cache locality in hot loops,
+# causing timing-sensitive tests to fail.
+if (NOT SANITIZE AND NOT SANITIZE_COVERAGE AND NOT WITH_COVERAGE)
+    set(COMPILER_FLAGS "${COMPILER_FLAGS} -ffunction-sections -fdata-sections")
+    # -faddrsig emits an address-significance table that lets lld's ICF
+    # distinguish address-taken symbols from non-address-taken ones.
+    # Only useful on Linux where we use lld with --icf=all; Darwin's ld64
+    # does not consume these sections.
+    if (OS_LINUX)
+        set(COMPILER_FLAGS "${COMPILER_FLAGS} -faddrsig")
+    endif ()
+endif()
 
 if (ARCH_AMD64)
     # align branches within a 32-Byte boundary to avoid the potential performance loss when code layout change,
@@ -306,8 +329,6 @@ endif()
 
 # Disable floating-point expression contraction in order to get consistent floating point calculation results across platforms
 set (COMPILER_FLAGS "${COMPILER_FLAGS} -ffp-contract=off")
-
-set (COMPILER_FLAGS "${COMPILER_FLAGS} -fPIC")
 
 set (DEBUG_INFO_FLAGS "-g")
 if (DISABLE_ALL_DEBUG_SYMBOLS)
@@ -339,44 +360,30 @@ endif()
 # https://stackoverflow.com/questions/63386189/whats-the-difference-between-a-compilers-o0-option-and-og-option/63386263#63386263
 set(DEBUG_O_LEVEL "g" CACHE STRING "The -Ox level used for debug builds")
 
-set (CMAKE_CXX_FLAGS                     "${CMAKE_CXX_FLAGS} ${COMPILER_FLAGS}")
-set (CMAKE_CXX_FLAGS_RELWITHDEBINFO      "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -fPIC -O3 ${DEBUG_INFO_FLAGS} ${CMAKE_CXX_FLAGS_ADD}")
+set (CMAKE_CXX_FLAGS                     "${CMAKE_CXX_FLAGS} ${COMPILER_FLAGS} ${CMAKE_CXX_FLAGS_ADD}")
+set (CMAKE_CXX_FLAGS_RELWITHDEBINFO      "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -O3 ${DEBUG_INFO_FLAGS} ${CMAKE_CXX_FLAGS_ADD}")
 set (CMAKE_CXX_FLAGS_DEBUG               "${CMAKE_CXX_FLAGS_DEBUG} -O${DEBUG_O_LEVEL} ${DEBUG_INFO_FLAGS} ${CMAKE_CXX_FLAGS_ADD}")
 
 set (CMAKE_C_FLAGS                       "${CMAKE_C_FLAGS} ${COMPILER_FLAGS} ${CMAKE_C_FLAGS_ADD}")
-set (CMAKE_C_FLAGS_RELWITHDEBINFO        "${CMAKE_C_FLAGS_RELWITHDEBINFO} -fPIC -O3 ${DEBUG_INFO_FLAGS} ${CMAKE_C_FLAGS_ADD}")
+set (CMAKE_C_FLAGS_RELWITHDEBINFO        "${CMAKE_C_FLAGS_RELWITHDEBINFO} -O3 ${DEBUG_INFO_FLAGS} ${CMAKE_C_FLAGS_ADD}")
 set (CMAKE_C_FLAGS_DEBUG                 "${CMAKE_C_FLAGS_DEBUG} -O${DEBUG_O_LEVEL} ${DEBUG_INFO_FLAGS} ${CMAKE_C_FLAGS_ADD}")
 
 set (CMAKE_ASM_FLAGS                     "${CMAKE_ASM_FLAGS} ${COMPILER_FLAGS} ${CMAKE_ASM_FLAGS_ADD}")
-set (CMAKE_ASM_FLAGS_RELWITHDEBINFO      "${CMAKE_ASM_FLAGS_RELWITHDEBINFO} -fPIC -O3 ${DEBUG_INFO_FLAGS} ${CMAKE_ASM_FLAGS_ADD}")
+set (CMAKE_ASM_FLAGS_RELWITHDEBINFO      "${CMAKE_ASM_FLAGS_RELWITHDEBINFO} -O3 ${DEBUG_INFO_FLAGS} ${CMAKE_ASM_FLAGS_ADD}")
 set (CMAKE_ASM_FLAGS_DEBUG               "${CMAKE_ASM_FLAGS_DEBUG} -O${DEBUG_O_LEVEL} ${DEBUG_INFO_FLAGS} ${CMAKE_ASM_FLAGS_ADD}")
 
 if (OS_DARWIN)
-    # Set macOS deployment target if specified
-    if (CMAKE_OSX_DEPLOYMENT_TARGET)
-        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-macosx_version_min,${CMAKE_OSX_DEPLOYMENT_TARGET}")
-        set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-macosx_version_min,${CMAKE_OSX_DEPLOYMENT_TARGET}")
-    endif()
-    if (USE_PYTHON)
-        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-undefined,dynamic_lookup")
-    else()
-        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-U,_inside_main")
-    endif()
-elseif (USE_PYTHON)
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--unresolved-symbols=ignore-all")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-U,_inside_main")
 endif()
 
 # Display absolute paths in error messages. Otherwise KDevelop fails to navigate to correct file and opens a new file instead.
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fdiagnostics-absolute-paths")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fdiagnostics-absolute-paths")
 
-if (NOT ENABLE_TESTS AND NOT ENABLE_CLANG_TIDY AND NOT SANITIZE AND NOT SANITIZE_COVERAGE AND OS_LINUX)
-    # https://clang.llvm.org/docs/ThinLTO.html
-    # Applies to clang and linux only.
-    # Disabled when building with tests or sanitizers.
-    # Also disabled with clang-tidy where we don't care about linking
-    option(ENABLE_THINLTO "Clang-specific link time optimization" ON)
-endif()
+# https://clang.llvm.org/docs/ThinLTO.html
+# Applies to clang and linux only.
+# Disabled by default; explicitly enabled in CI for release and performance builds.
+option(ENABLE_THINLTO "Clang-specific link time optimization" OFF)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fstrict-vtable-pointers")
 
@@ -413,9 +420,6 @@ include(cmake/limit_jobs.cmake)
 # Turns on all external libs like s3, kafka, ODBC, ...
 option(ENABLE_LIBRARIES "Enable all external libraries by default" ON)
 
-# Don't use the system compiler-rt library even if it is available. Instead build it directly
-option(USE_SYSTEM_COMPILER_RT "Use the system compiler-rt if available. If disabled it will be built from sources (supported for Linux and FreeBSD)" OFF)
-
 # Increase stack size on Musl. We need big stack for our recursive-descend parser.
 if (USE_MUSL)
     set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-z,stack-size=2097152")
@@ -436,7 +440,7 @@ endif ()
 link_libraries(global-group)
 target_link_libraries(global-group INTERFACE $<TARGET_PROPERTY:global-libs,INTERFACE_LINK_LIBRARIES>)
 
-option (ENABLE_FIU "Enable Fiu" ON)
+option (ENABLE_LIBFIU "Enable libfiu" ON)
 
 option(WERROR "Enable -Werror compiler option" ON)
 
@@ -448,9 +452,9 @@ if (WERROR)
 endif ()
 
 # Make this extra-checks for correct library dependencies.
-# if (OS_LINUX AND NOT SANITIZE)
-#     target_link_options(global-group INTERFACE "LINKER:--no-undefined")
-# endif ()
+if (OS_LINUX AND NOT SANITIZE)
+    target_link_options(global-group INTERFACE "LINKER:--no-undefined")
+endif ()
 
 ######################################
 ### Add targets below this comment ###
@@ -472,27 +476,26 @@ set (CMAKE_POSTFIX_VARIABLE "CMAKE_${CMAKE_BUILD_TYPE_UC}_POSTFIX")
 #
 # For some sophisticated platforms we have different issues with fPIC:
 # For example riscv toolchain itself compiled without fPIC
-# if (NOT ENABLE_THINLTO AND (ARCH_AMD64 OR ARCH_AARCH64))
-#    set(ENABLE_POSITION_INDEPENDENT_BINARY 1)
-# endif()
+if (NOT ENABLE_THINLTO AND (ARCH_AMD64 OR ARCH_AARCH64))
+    set(ENABLE_POSITION_INDEPENDENT_BINARY 1)
+endif()
 
-# if (ENABLE_POSITION_INDEPENDENT_BINARY)
-#    set (CMAKE_POSITION_INDEPENDENT_CODE OFF)
-#    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
-#    set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
-# endif()
-set (CMAKE_POSITION_INDEPENDENT_CODE ON)
+if (ENABLE_POSITION_INDEPENDENT_BINARY)
+    set (CMAKE_POSITION_INDEPENDENT_CODE OFF)
+    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
+endif()
 
-# if (NOT OS_ANDROID AND OS_LINUX AND NOT ARCH_S390X AND NOT SANITIZE AND NOT ENABLE_POSITION_INDEPENDENT_BINARY) 
-#     # Using '-no-pie' builds executables with fixed addresses, resulting in slightly more efficient code
-#     # and keeping binary addresses constant even with ASLR enabled.
-#     # Disabled on Android as it requires PIE: https://source.android.com/docs/security/enhancements#android-5
-#     # Slightly more efficient code can be generated
-#     # It's disabled for ARM because otherwise ClickHouse cannot run on Android.
-#     set (CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -fno-pie")
-#     set (CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO} -fno-pie")
-#     set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -no-pie -Wl,-no-pie")
-# endif ()
+if (NOT OS_ANDROID AND OS_LINUX AND NOT ARCH_S390X AND NOT SANITIZE AND NOT ENABLE_POSITION_INDEPENDENT_BINARY)
+    # Using '-no-pie' builds executables with fixed addresses, resulting in slightly more efficient code
+    # and keeping binary addresses constant even with ASLR enabled.
+    # Disabled on Android as it requires PIE: https://source.android.com/docs/security/enhancements#android-5
+    # Disabled on IBM S390X due to build issues with 'no-pie'
+    # Disabled with sanitizers to avoid issues with maximum relocation size: https://github.com/ClickHouse/ClickHouse/pull/49145
+    set (CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -fno-pie")
+    set (CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO} -fno-pie")
+    set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -no-pie -Wl,-no-pie")
+endif ()
 
 if (ENABLE_TESTS)
     message (STATUS "Unit tests are enabled")
@@ -535,12 +538,7 @@ endif()
 enable_dummy_launchers_if_needed()
 
 if (NOT ENABLE_JEMALLOC)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DUSE_JEMALLOC=0")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DUSE_JEMALLOC=0")
     message (WARNING "Non default allocator is disabled. This is not recommended for production builds.")
-else ()
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DUSE_JEMALLOC=1 -DJEMALLOC_NO_RENAME=1 -DARROW_JEMALLOC=1")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DUSE_JEMALLOC=1 -DJEMALLOC_NO_RENAME=1 -DARROW_JEMALLOC=1")
 endif ()
 
 macro (clickhouse_add_executable target)
@@ -607,7 +605,7 @@ if (ENABLE_RUST)
 endif()
 
 if (CMAKE_BUILD_TYPE_UC STREQUAL "RELWITHDEBINFO"
-    AND NOT SANITIZE AND NOT SANITIZE_COVERAGE AND NOT ENABLE_FUZZING
+    AND NOT SANITIZE AND NOT ENABLE_FUZZING
     AND OMIT_HEAVY_DEBUG_SYMBOLS AND OS_LINUX AND (ARCH_AMD64 OR ARCH_AARCH64))
     set(CHECK_LARGE_OBJECT_SIZES_DEFAULT ON)
 else ()
@@ -696,8 +694,6 @@ if (NATIVE_BUILD_TARGETS
             "-DCMAKE_BUILD_TYPE=Release"
             # Avoid overriding .cargo/config.toml with native toolchain.
             "-DENABLE_RUST=OFF"
-            # ISA-L requires NASM which may not be available in cross-compilation
-            "-DENABLE_ISAL_LIBRARY=OFF"
             "-DENABLE_CLICKHOUSE_SELF_EXTRACTING=${ENABLE_CLICKHOUSE_SELF_EXTRACTING}"
             "-DUSE_BINARY_HASH=${USE_BINARY_HASH}"
         ${PROJECT_SOURCE_DIR}

@@ -16,8 +16,9 @@
 #include <IO/WriteBufferFromFile.h>
 #include <IO/WriteHelpers.h>
 
-#include <Parsers/IAST.h>
 #include <Interpreters/Context.h>
+
+#include <Parsers/IAST.h>
 #include <Parsers/parseQuery.h>
 #include <Parsers/ParserCreateFunctionQuery.h>
 
@@ -90,6 +91,7 @@ ASTPtr UserDefinedSQLObjectsDiskStorage::tryLoadObject(UserDefinedSQLObjectType 
         {
             case UserDefinedSQLObjectType::Function:
             {
+                auto context = getContext();
                 ParserCreateFunctionQuery parser;
                 ASTPtr ast = parseQuery(
                     parser,
@@ -97,8 +99,8 @@ ASTPtr UserDefinedSQLObjectsDiskStorage::tryLoadObject(UserDefinedSQLObjectType 
                     object_create_query.data() + object_create_query.size(),
                     "",
                     0,
-                    global_context->getSettingsRef()[Setting::max_parser_depth],
-                    global_context->getSettingsRef()[Setting::max_parser_backtracks]);
+                    context->getSettingsRef()[Setting::max_parser_depth],
+                    context->getSettingsRef()[Setting::max_parser_backtracks]);
                 return ast;
             }
         }
@@ -130,8 +132,6 @@ void UserDefinedSQLObjectsDiskStorage::loadObjectsImpl()
 
     if (!std::filesystem::exists(dir_path))
     {
-        setAllObjects({});
-        objects_loaded = false;
         LOG_DEBUG(log, "The directory for user defined objects ({}) does not exist: nothing to load", dir_path);
         return;
     }

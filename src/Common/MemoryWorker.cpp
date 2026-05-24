@@ -4,6 +4,7 @@
 #include <IO/ReadBufferFromFileDescriptor.h>
 #include <IO/ReadHelpers.h>
 #include <base/cgroupsv2.h>
+#include <base/getMemoryAmount.h>
 #include <Common/Jemalloc.h>
 #include <Common/MemoryTracker.h>
 #include <Common/OSThreadNiceValue.h>
@@ -283,7 +284,7 @@ MemoryWorker::MemoryWorker(
             static constexpr uint64_t cgroups_memory_usage_tick_ms{50};
 
             const auto [cgroup_path, version] = ICgroupsReader::getCgroupsPath();
-            LOG_DEBUG(
+            LOG_INFO(
                 getLogger("CgroupsReader"),
                 "Will create cgroup reader from '{}' (cgroups version: {})",
                 cgroup_path,
@@ -330,7 +331,7 @@ void MemoryWorker::start()
               page_size)
         : "disabled";
 
-    LOG_DEBUG(
+    LOG_INFO(
         log,
         "Starting background memory thread with period of {}ms, using {} as source, purging dirty pages {}",
         rss_update_period_ms,
@@ -534,7 +535,12 @@ void MemoryWorker::setDirtyDecayForAllArenas(size_t decay_ms)
 
         /// Now update all EXISTING arenas
         /// Query how many arenas currently exist
-        unsigned narenas = Jemalloc::getValue<unsigned>("arenas.narenas");
+        unsigned narenas = 0;
+        if (!Jemalloc::tryGetValue("arenas.narenas", narenas))
+        {
+            LOG_TRACE(log, "jemalloc mallctl arenas.narenas unavailable; skipping per-arena dirty_decay_ms update");
+            return;
+        }
 
         /// Iterate through each arena and set its dirty_decay_ms
         for (unsigned i = 0; i < narenas; ++i)
@@ -570,9 +576,20 @@ void MemoryWorker::purgeDirtyPagesThread()
     std::unique_lock purge_dirty_pages_lock(purge_dirty_pages_mutex);
 
     uint64_t default_dirty_decay_ms = dirty_decay_ms_mib.getValue();
-    /// chDB: suppress this startup INFO log to keep embedded usage quiet.
-    /// See https://github.com/chdb-io/chdb-core/issues/55
-    /// LOG_INFO(log, "Default dirty pages decay period: {}ms", default_dirty_decay_ms);
+    LOG_INFO(log, "Default dirty pages decay period: {}ms", default_dirty_decay_ms);
+
+    /// On low-memory systems (< 4 GiB), disable jemalloc dirty page retention
+    /// (dirty_decay_ms=0) to prevent RSS inflation.
+    {
+        size_t available_memory = getMemoryAmount();
+        if (available_memory > 0 && available_memory < (4ul << 30))
+        {
+            LOG_INFO(log, "Low memory system detected ({}). Setting dirty_decay_ms=0",
+                formatReadableSizeWithBinarySuffix(available_memory));
+            setDirtyDecayForAllArenas(0);
+            default_dirty_decay_ms = 0;
+        }
+    }
     while (true)
     {
         try

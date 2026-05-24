@@ -2,8 +2,12 @@
 
 set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w -ffunction-sections -fdata-sections")
 set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w -ffunction-sections -fdata-sections")
+if (OS_LINUX)
+    set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -faddrsig")
+    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -faddrsig")
+endif ()
 
-if (SANITIZE STREQUAL "undefined")
+if (SANITIZE STREQUAL "undefined" OR SANITIZE STREQUAL "address,undefined")
     # 3rd-party libraries usually not intended to work with UBSan.
     add_compile_options(-fno-sanitize=undefined)
 endif()
@@ -49,6 +53,7 @@ add_contrib (abseil-cpp-cmake abseil-cpp)
 add_contrib (zlib-ng-cmake zlib-ng)
 add_contrib (google-protobuf-cmake google-protobuf)
 add_contrib (grpc-cmake grpc)
+add_contrib (compiler-rt-cmake llvm-project)
 add_contrib (libllvmlibc-cmake llvm-project)
 add_contrib (llvm-project-cmake llvm-project)
 
@@ -64,7 +69,7 @@ add_contrib (magic-enum-cmake magic_enum)
 add_contrib (boost-cmake boost)
 add_contrib (cctz-cmake cctz)
 add_contrib (consistent-hashing)
-add_contrib (dragonbox-cmake dragonbox)
+add_contrib (zmij-cmake zmij)
 add_contrib (vectorscan-cmake vectorscan)
 add_contrib (jemalloc-cmake jemalloc)
 add_contrib (libcpuid-cmake libcpuid)
@@ -106,14 +111,9 @@ add_contrib (wyhash-cmake wyhash)
 add_contrib (cityhash102)
 add_contrib (libfarmhash)
 add_contrib (icu-cmake icu)
-add_contrib (utf8proc-cmake utf8proc)
 add_contrib (h3-cmake h3)
 add_contrib (mariadb-connector-c-cmake mariadb-connector-c)
 add_contrib (libfiu-cmake libfiu)
-
-if (ENABLE_PYTHON)
-    add_contrib (pybind11-cmake pybind11)
-endif()
 
 if (ENABLE_TESTS)
     add_contrib (googletest-cmake googletest)
@@ -179,9 +179,10 @@ if (USE_MONGODB)
     add_contrib (mongo-cxx-driver-cmake mongo-cxx-driver) # requires: libmongoc, libbson
 endif()
 
+add_contrib (libstemmer-c-cmake libstemmer_c)
+
 option(ENABLE_NLP "Enable NLP functions support" ${ENABLE_LIBRARIES})
 if (ENABLE_NLP)
-    add_contrib (libstemmer-c-cmake libstemmer_c)
     add_contrib (wordnet-blast-cmake wordnet-blast)
     add_contrib (lemmagen-c-cmake lemmagen-c)
     add_contrib (cld2-cmake cld2)
@@ -257,6 +258,9 @@ add_contrib (bech32)
 add_contrib (libcotp-cmake libcotp)
 
 add_contrib (clickstack-cmake clickstack)
+
+add_contrib (librseq-cmake librseq)
+add_contrib (silk-cmake silk)
 
 # Put all targets defined here and in subdirectories under "contrib/<immediate-subdir>" folders in GUI-based IDEs.
 # Some of third-party projects may override CMAKE_FOLDER or FOLDER property of their targets, so they would not appear

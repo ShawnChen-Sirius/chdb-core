@@ -120,10 +120,6 @@ ThreadStatus::ThreadStatus()
 
     current_thread = this;
 
-#if USE_JEMALLOC
-    Memory::disable_memory_check = true;
-#endif
-
     /// NOTE: It is important not to do any non-trivial actions (like updating ProfileEvents or logging) before ThreadStatus is created
     /// Otherwise it could lead to SIGSEGV due to current_thread dereferencing
 
@@ -243,7 +239,7 @@ void ThreadStatus::flushUntrackedMemory()
         return;
 
     MemoryTrackerBlockerInThread blocker(untracked_memory_blocker_level);
-    Int64 current_untracked_memory = current_thread->untracked_memory;
+    Int64 current_untracked_memory = untracked_memory;
     untracked_memory = 0;
     memory_tracker.adjustWithUntrackedMemory(current_untracked_memory);
 }
@@ -282,10 +278,6 @@ ThreadStatus::~ThreadStatus()
 
     /// Flush untracked_memory **right before** switching the current_thread to avoid losing untracked_memory in deleter (detachFromGroup)
     flushUntrackedMemory();
-
-#if USE_JEMALLOC
-    Memory::disable_memory_check = false;
-#endif
 
     /// Only change current_thread if it's currently being used by this ThreadStatus
     /// For example, PushingToViews chain creates and deletes ThreadStatus instances while running in the main query thread

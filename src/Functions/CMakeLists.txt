@@ -2,45 +2,7 @@ add_subdirectory(divide)
 
 include("${ClickHouse_SOURCE_DIR}/cmake/dbms_glob_sources.cmake")
 add_headers_and_sources(clickhouse_functions .)
-
-option(CHDB_MINIMAL_FUNCTIONS "Build with minimal SQL functions for chdb" OFF)
-
-if (CHDB_MINIMAL_FUNCTIONS)
-    message(STATUS "Building with MINIMAL SQL functions (whitelist mode)")
-    set(clickhouse_functions_sources "")
-    list(APPEND clickhouse_functions_sources
-        "${CMAKE_CURRENT_SOURCE_DIR}/IFunction.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/IFunctionAdaptors.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/FunctionDynamicAdaptor.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/FunctionFactory.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/FunctionHelpers.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/FunctionsLogical.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/if.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/multiIf.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/multiMatchAny.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/checkHyperscanRegexp.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/CastOverloadResolver.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/FunctionsConversion.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/FunctionsConversion_impl0.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/FunctionsConversion_impl1.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/FunctionsConversion_impl2.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/FunctionsConversion_impl3.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/searchAnyAll.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/extractTimeZoneFromFunctionArguments.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/generateSnowflakeID.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/registerFunctions.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/FunctionGenerateRandomStructure.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/chdbVersion.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/serverConstants.cpp"
-        # Comparison functions
-        "${CMAKE_CURRENT_SOURCE_DIR}/equals.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/notEquals.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/less.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/lessOrEquals.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/greater.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/greaterOrEquals.cpp"
-    )
-endif()
+add_headers_and_sources(clickhouse_functions AI)
 
 # These files are moved from clickhouse_functions into dbms to make dbms self-contained (not depend on clickhouse_functions)
 # This allows less dependency and linker work (specially important when building many example executables)
@@ -174,10 +136,6 @@ if (TARGET ch_contrib::h3)
     list (APPEND PRIVATE_LIBS ch_contrib::h3)
 endif()
 
-if (TARGET ch_contrib::utf8proc)
-    list (APPEND PRIVATE_LIBS ch_contrib::utf8proc)
-endif()
-
 if (TARGET ch_contrib::vectorscan)
     list (APPEND PRIVATE_LIBS ch_contrib::vectorscan)
 endif()
@@ -253,16 +211,7 @@ set(dbms_headers "${dbms_headers}" PARENT_SCOPE)
 
 target_link_libraries(clickhouse_functions_obj PUBLIC ${PUBLIC_LIBS} PRIVATE ${PRIVATE_LIBS})
 
-if (USE_STATIC_LIBRARIES OR NOT SPLIT_SHARED_LIBRARIES)
-    # Used to forward the linking information to the final binaries such as clickhouse / unit_tests_dbms,
-    # since such information are lost after we convert to OBJECT target
-    add_library(clickhouse_functions INTERFACE)
-    target_link_libraries(clickhouse_functions INTERFACE ${OBJECT_LIBS} ${PUBLIC_LIBS} ${PRIVATE_LIBS})
-else()
-    add_library(clickhouse_functions SHARED ${OBJECT_LIBS})
-    target_link_libraries(clickhouse_functions PUBLIC ${PUBLIC_LIBS} PRIVATE ${PRIVATE_LIBS})
-endif ()
-
-if (CHDB_VERSION)
-    add_compile_definitions(CHDB_VERSION_STRING="${CHDB_VERSION}")
-endif ()
+# Used to forward the linking information to the final binaries such as clickhouse / unit_tests_dbms,
+# since such information are lost after we convert to OBJECT target
+add_library(clickhouse_functions INTERFACE)
+target_link_libraries(clickhouse_functions INTERFACE ${OBJECT_LIBS} ${PUBLIC_LIBS} ${PRIVATE_LIBS})

@@ -1,14 +1,13 @@
 #pragma once
 
 #include <cstdlib>
-
 #include <new>
 #include <base/defines.h>
 
 #include <Common/AllocationInterceptors.h>
 #include <Common/Concepts.h>
 #include <Common/CurrentMemoryTracker.h>
-#include <Common/MemoryTrackerDebugBlockerInThread.h>
+#include <Common/MemoryTrackerUntrackedAllocationsBlockerInThread.h>
 
 #if defined(OS_LINUX)
 #    include <malloc.h>
@@ -28,27 +27,6 @@ void memoryGuardRemove(void *addr, size_t len);
 
 namespace Memory
 {
-#if USE_JEMALLOC
-extern thread_local bool disable_memory_check;
-
-class MemoryCheckScope
-{
-public:
-    MemoryCheckScope() noexcept
-        : old_value(disable_memory_check)
-    {
-        disable_memory_check = false;
-    }
-
-    ~MemoryCheckScope() noexcept { disable_memory_check = old_value; }
-
-    MemoryCheckScope(const MemoryCheckScope &) = delete;
-    MemoryCheckScope & operator=(const MemoryCheckScope &) = delete;
-
-private:
-    bool old_value;
-};
-#endif
 
 inline ALWAYS_INLINE size_t alignToSizeT(std::align_val_t align) noexcept
 {
@@ -59,62 +37,6 @@ inline ALWAYS_INLINE size_t alignUp(size_t size, size_t align) noexcept
 {
     return (size + align - 1) / align * align;
 }
-
-
-#if USE_JEMALLOC
-template <std::same_as<std::align_val_t>... TAlign>
-requires DB::OptionalArgument<TAlign...>
-inline ALWAYS_INLINE void * newImpl(std::size_t size, TAlign... align)
-{
-    void * ptr = nullptr;
-    if constexpr (sizeof...(TAlign) == 1)
-        ptr = je_aligned_alloc(alignToSizeT(align...), size);
-    else
-        ptr = je_malloc(size);
-
-    if (likely(ptr != nullptr))
-        return ptr;
-
-    /// @note no std::get_new_handler logic implemented
-    throw std::bad_alloc{};
-}
-
-#else
-template <std::same_as<std::align_val_t>... TAlign>
-requires DB::OptionalArgument<TAlign...>
-inline ALWAYS_INLINE void * newImpl(std::size_t size, TAlign... align)
-{
-    void * ptr = nullptr;
-    if constexpr (sizeof...(TAlign) == 1)
-        ptr = __real_aligned_alloc(alignToSizeT(align...), alignUp(size, alignToSizeT(align...)));
-    else
-        ptr = __real_malloc(size);
-
-    if (likely(ptr != nullptr))
-        return ptr;
-
-    /// @note no std::get_new_handler logic implemented
-    throw std::bad_alloc{};
-}
-#endif
-
-#if USE_JEMALLOC
-inline ALWAYS_INLINE void * newNoExcept(std::size_t size) noexcept
-{
-    return je_malloc(size);
-}
-
-inline ALWAYS_INLINE void * newNoExcept(std::size_t size, std::align_val_t align) noexcept
-{
-    return je_aligned_alloc(static_cast<size_t>(align), size);
-}
-
-inline ALWAYS_INLINE void deleteImpl(void * ptr) noexcept
-{
-    je_free(ptr);
-}
-
-#else
 
 inline ALWAYS_INLINE void * newNoExcept(std::size_t size) noexcept
 {
@@ -130,8 +52,6 @@ inline ALWAYS_INLINE void deleteImpl(void * ptr) noexcept
 {
     __real_free(ptr);
 }
-#endif
-
 
 #if USE_JEMALLOC
 
@@ -141,6 +61,7 @@ inline ALWAYS_INLINE void deleteSized(void * ptr, std::size_t size, TAlign... al
 {
     if (ptr == nullptr) [[unlikely]]
         return;
+
     if constexpr (sizeof...(TAlign) == 1)
         je_sdallocx(ptr, size, MALLOCX_ALIGN(alignToSizeT(align...)));
     else
@@ -198,7 +119,7 @@ template <std::same_as<std::align_val_t>... TAlign>
 requires DB::OptionalArgument<TAlign...>
 inline ALWAYS_INLINE size_t trackMemoryFromC(std::size_t size, AllocationTrace & trace, TAlign... align)
 {
-    [[maybe_unused]] MemoryTrackerDebugBlockerInThread blocker;
+    [[maybe_unused]] MemoryTrackerUntrackedAllocationsBlockerInThread blocker;
     std::size_t actual_size = getActualAllocationSize(size, align...);
     trace = CurrentMemoryTracker::allocNoThrow(actual_size);
     return actual_size;

@@ -59,8 +59,8 @@ MergeTreeBackgroundExecutor<Queue>::MergeTreeBackgroundExecutor(
     , pool(std::make_unique<ThreadPool>(
           CurrentMetrics::MergeTreeBackgroundExecutorThreads, CurrentMetrics::MergeTreeBackgroundExecutorThreadsActive, CurrentMetrics::MergeTreeBackgroundExecutorThreadsScheduled))
 {
-    // if (max_tasks_count == 0)
-    //     throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "Task count for MergeTreeBackgroundExecutor must not be zero");
+    if (max_tasks_count == 0)
+        throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "Task count for MergeTreeBackgroundExecutor must not be zero");
 
     task_events.execute_ms = execute_profile_event_;
     task_events.cancel_ms = cancel_profile_event_;
@@ -109,17 +109,17 @@ void MergeTreeBackgroundExecutor<Queue>::increaseThreadsAndMaxTasksCount(size_t 
     /// Do not throw any exceptions from global pool. Just log a warning and silently return.
     if (new_threads_count < threads_count)
     {
-        LOG_WARNING(log, "Loaded new threads count for {}Executor from top level config, but new value ({}) is not greater than current {}", name, new_threads_count, threads_count);
+        LOG_WARNING(log, "Loaded new threads count for {}Executor from top level config, but new value ({}) is not greater than current {}", toString(name), new_threads_count, threads_count);
         return;
     }
 
     if (new_max_tasks_count < max_tasks_count.load(std::memory_order_relaxed))
     {
-        LOG_WARNING(log, "Loaded new max tasks count for {}Executor from top level config, but new value ({}) is not greater than current {}", name, new_max_tasks_count, max_tasks_count.load());
+        LOG_WARNING(log, "Loaded new max tasks count for {}Executor from top level config, but new value ({}) is not greater than current {}", toString(name), new_max_tasks_count, max_tasks_count.load());
         return;
     }
 
-    LOG_INFO(log, "Loaded new threads count ({}) and max tasks count ({}) for {}Executor", new_threads_count, new_max_tasks_count, name);
+    LOG_INFO(log, "Loaded new threads count ({}) and max tasks count ({}) for {}Executor", new_threads_count, new_max_tasks_count, toString(name));
 
     pending.setCapacity(new_max_tasks_count);
     active.set_capacity(new_max_tasks_count);
@@ -174,36 +174,32 @@ void printExceptionWithRespectToAbort(LoggerPtr log, const String & query_id)
     if (ex == nullptr)
         return;
 
-    NOEXCEPT_SCOPE({
-        ALLOW_ALLOCATIONS_IN_SCOPE;
-        tryLogCurrentException(log, "Exception while executing background task {" + query_id + "}");
-    });
-    // try
-    // {
-    //     std::rethrow_exception(ex);
-    // }
-    // catch (const TestException &) // NOLINT
-    // {
-    //     /// Exception from a unit test, ignore it.
-    // }
-    // catch (Exception & e)
-    // {
-    //     NOEXCEPT_SCOPE({
-    //         ALLOW_ALLOCATIONS_IN_SCOPE;
-    //         /// Cancelled merging parts is not an error - log normally.
-    //         if (e.code() == ErrorCodes::ABORTED)
-    //             LOG_DEBUG(log, getExceptionMessageAndPattern(e, /* with_stacktrace */ false));
-    //         else
-    //             tryLogCurrentException(log, "Exception while executing background task {" + query_id + "}");
-    //     });
-    // }
-    // catch (...)
-    // {
-    //     NOEXCEPT_SCOPE({
-    //         ALLOW_ALLOCATIONS_IN_SCOPE;
-    //         tryLogCurrentException(log, "Exception while executing background task {" + query_id + "}");
-    //     });
-    // }
+    try
+    {
+        std::rethrow_exception(ex);
+    }
+    catch (const TestException &) // NOLINT
+    {
+        /// Exception from a unit test, ignore it.
+    }
+    catch (const Exception & e)
+    {
+        NOEXCEPT_SCOPE({
+            ALLOW_ALLOCATIONS_IN_SCOPE;
+            /// Cancelled merging parts is not an error - log normally.
+            if (e.code() == ErrorCodes::ABORTED)
+                LOG_DEBUG(log, getExceptionMessageAndPattern(e, /* with_stacktrace */ false));
+            else
+                tryLogCurrentException(log, "Exception while executing background task {" + query_id + "}");
+        });
+    }
+    catch (...)
+    {
+        NOEXCEPT_SCOPE({
+            ALLOW_ALLOCATIONS_IN_SCOPE;
+            tryLogCurrentException(log, "Exception while executing background task {" + query_id + "}");
+        });
+    }
 }
 
 template <class Queue>
@@ -271,11 +267,9 @@ void MergeTreeBackgroundExecutor<Queue>::routine(TaskRuntimeDataPtr item)
         /// Slow part: destroy the task outside the lock.
         NOEXCEPT_SCOPE({
             ALLOW_ALLOCATIONS_IN_SCOPE;
+            captured_storage_id = item_->storage_id.getNameForLogs();
             if (item_->task)
-            {
-                captured_storage_id = item_->task->getStorageID().getNameForLogs();
                 captured_query_id = item_->task->getQueryId();
-            }
             item_->resetTask();
         });
 
@@ -291,9 +285,9 @@ void MergeTreeBackgroundExecutor<Queue>::routine(TaskRuntimeDataPtr item)
             if (elapsed_ms > THRESHOLD_MILLISECONDS)
             {
                 LOG_WARNING(log,
-                    "Releasing background task runtime data took {} milliseconds, executor={}, storage={}, query_id={}",
+                    "Destroying background task took {} milliseconds, executor={}, storage={}, query_id={}",
                     elapsed_ms,
-                    name,
+                    toString(name),
                     captured_storage_id.value_or("unknown"),
                     captured_query_id.value_or("unknown"));
             }
@@ -307,7 +301,7 @@ void MergeTreeBackgroundExecutor<Queue>::routine(TaskRuntimeDataPtr item)
         item_.reset();
     };
 
-    /// No TSA because of unique_lock
+    /// No TSA because LockGuardWithStopWatch wraps mutex locking and is not understood by TSA
     auto restart_task = [this, &erase_from_active, &release_task] (TaskRuntimeDataPtr && item_) TSA_NO_THREAD_SAFETY_ANALYSIS
     {
         {
@@ -326,12 +320,13 @@ void MergeTreeBackgroundExecutor<Queue>::routine(TaskRuntimeDataPtr item)
             }
         }
 
-        /// No lock here.
+        /// No lock here. The storage is being deleted, do the heavy work outside the lock.
+        /// removeTasksCorrespondingToStorage has already found this item and is waiting on is_done,
+        /// so the storage won't be destroyed until we signal completion below.
         {
             ALLOW_ALLOCATIONS_IN_SCOPE;
             item_->cancel();
         }
-
         /// release_task handles destruction outside the lock, then cleanup under the lock.
         release_task(std::move(item_));
     };
@@ -340,9 +335,11 @@ void MergeTreeBackgroundExecutor<Queue>::routine(TaskRuntimeDataPtr item)
 
     auto complete_task = [this, &release_task] (TaskRuntimeDataPtr && item_)
     {
+        /// Run onCompleted outside the lock — it can be slow (especially under sanitizers)
+        /// and holding the mutex here was the root cause of lock-contention warnings.
+        /// The item stays in `active` during onCompleted, so removeTasksCorrespondingToStorage
+        /// can still find it and wait on is_done.
         {
-            LockGuardWithStopWatch lock(mutex, log, __PRETTY_FUNCTION__);
-
             Stopwatch watch_on_completed;
             ALLOW_ALLOCATIONS_IN_SCOPE;
             /// In a situation of a lack of memory this method can throw an exception,
@@ -352,7 +349,7 @@ void MergeTreeBackgroundExecutor<Queue>::routine(TaskRuntimeDataPtr item)
 
             if (watch_on_completed.elapsedMilliseconds() > 1000)
             {
-                LOG_WARNING(log, "Execution of callback took {} ms in [{}], Stack trace (when copying this message, always include the lines below): \n {}",
+                LOG_WARNING(log, "Execution of callback onCompleted took {} ms in [{}], Stack trace (when copying this message, always include the lines below):\n{}",
                     watch_on_completed.elapsedMilliseconds(), __PRETTY_FUNCTION__, StackTrace().toString());
             }
         }

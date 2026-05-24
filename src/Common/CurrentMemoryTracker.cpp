@@ -4,13 +4,10 @@
 #include <Common/MemoryTracker.h>
 #include <Common/MemoryTrackerBlockerInThread.h>
 
-std::atomic<bool> g_memory_tracking_disabled{false};
 
 #ifdef MEMORY_TRACKER_DEBUG_CHECKS
 thread_local bool memory_tracker_always_throw_logical_error_on_allocation = false;
 #endif
-
-extern bool chdb_embedded_server_initialized;
 
 namespace DB
 {
@@ -25,14 +22,8 @@ namespace
 
 MemoryTracker * getMemoryTracker()
 {
-    if (unlikely(g_memory_tracking_disabled.load(std::memory_order_relaxed)))
-        return nullptr;
-
     if (auto * thread_memory_tracker = DB::CurrentThread::getMemoryTracker())
         return thread_memory_tracker;
-
-    if (likely(chdb_embedded_server_initialized))
-        return &total_memory_tracker;
 
     /// total_memory_tracker can be used before MainThreadStatus is initialized,
     /// but only after its own initialization and before teardown.
@@ -75,6 +66,7 @@ AllocationTrace CurrentMemoryTracker::allocImpl(Int64 size, bool throw_if_memory
             current_thread->flushUntrackedMemory();
         }
         current_thread->untracked_memory_blocker_level = blocker_level;
+
         Int64 previous_untracked_memory = current_thread->untracked_memory;
         current_thread->untracked_memory += size;
         if (current_thread->untracked_memory > current_thread->untracked_memory_limit)
@@ -93,8 +85,7 @@ AllocationTrace CurrentMemoryTracker::allocImpl(Int64 size, bool throw_if_memory
             }
         }
 
-        /// return AllocationTrace(memory_tracker->getSampleProbability(size));
-        return AllocationTrace(0);
+        return AllocationTrace(current_thread->getEffectiveSampleProbability(size));
     }
 
     return AllocationTrace(0);
@@ -140,8 +131,7 @@ AllocationTrace CurrentMemoryTracker::free(Int64 size)
             return memory_tracker->free(-untracked_memory);
         }
 
-        /// return AllocationTrace(memory_tracker->getSampleProbability(size));
-        return AllocationTrace(0);
+        return AllocationTrace(current_thread->getEffectiveSampleProbability(size));
     }
 
     return AllocationTrace(0);

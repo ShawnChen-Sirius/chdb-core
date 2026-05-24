@@ -248,7 +248,7 @@ ColumnPtr HashedArrayDictionary<dictionary_key_type, sharded>::getHierarchy(Colu
         std::optional<UInt64> null_value;
 
         if (!dictionary_attribute.null_value.isNull())
-            null_value = dictionary_attribute.null_value.template safeGet<UInt64>();
+            null_value = dictionary_attribute.null_value.safeGet<UInt64>();
 
 
         auto is_key_valid_func = [&, this](auto & key)
@@ -321,7 +321,7 @@ ColumnUInt8::Ptr HashedArrayDictionary<dictionary_key_type, sharded>::isInHierar
         std::optional<UInt64> null_value;
 
         if (!dictionary_attribute.null_value.isNull())
-            null_value = dictionary_attribute.null_value.template safeGet<UInt64>();
+            null_value = dictionary_attribute.null_value.safeGet<UInt64>();
 
 
         auto is_key_valid_func = [&](auto & key)
@@ -675,6 +675,31 @@ ColumnPtr HashedArrayDictionary<dictionary_key_type, sharded>::getAttributeColum
                 getItemsShortCircuitImpl<ValueType, false>(
                     attribute, keys_object, [&](const size_t, const Array & value, bool) { out->insert(value); }, default_mask);
             }
+            else if constexpr (std::is_same_v<ValueType, Map>)
+            {
+                auto * out = column.get();
+
+                getItemsShortCircuitImpl<ValueType, false>(
+                    attribute, keys_object, [&](const size_t, const Map & value, bool) { out->insert(value); }, default_mask);
+            }
+            else if constexpr (std::is_same_v<ValueType, Object>)
+            {
+                auto * out = column.get();
+
+                if (is_attribute_nullable)
+                    getItemsShortCircuitImpl<ValueType, true>(
+                        attribute,
+                        keys_object,
+                        [&](size_t row, const Object & value, bool is_null)
+                        {
+                            (*vec_null_map_to)[row] = is_null;
+                            out->insert(value);
+                        },
+                        default_mask);
+                else
+                    getItemsShortCircuitImpl<ValueType, false>(
+                        attribute, keys_object, [&](const size_t, const Object & value, bool) { out->insert(value); }, default_mask);
+            }
             else if constexpr (std::is_same_v<ValueType, std::string_view>)
             {
                 auto * out = column.get();
@@ -731,6 +756,37 @@ ColumnPtr HashedArrayDictionary<dictionary_key_type, sharded>::getAttributeColum
                     keys_object,
                     [&](const size_t, const Array & value, bool) { out->insert(value); },
                     default_value_extractor);
+            }
+            else if constexpr (std::is_same_v<ValueType, Map>)
+            {
+                auto * out = column.get();
+
+                getItemsImpl<ValueType, false>(
+                    attribute,
+                    keys_object,
+                    [&](const size_t, const Map & value, bool) { out->insert(value); },
+                    default_value_extractor);
+            }
+            else if constexpr (std::is_same_v<ValueType, Object>)
+            {
+                auto * out = column.get();
+
+                if (is_attribute_nullable)
+                    getItemsImpl<ValueType, true>(
+                        attribute,
+                        keys_object,
+                        [&](size_t row, const Object & value, bool is_null)
+                        {
+                            (*vec_null_map_to)[row] = is_null;
+                            out->insert(value);
+                        },
+                        default_value_extractor);
+                else
+                    getItemsImpl<ValueType, false>(
+                        attribute,
+                        keys_object,
+                        [&](const size_t, const Object & value, bool) { out->insert(value); },
+                        default_value_extractor);
             }
             else if constexpr (std::is_same_v<ValueType, std::string_view>)
             {
@@ -1089,6 +1145,16 @@ void HashedArrayDictionary<dictionary_key_type, sharded>::calculateBytesAllocate
                 {
                     /// It is not accurate calculations
                     bytes_allocated += sizeof(Array) * container.size();
+                }
+                else if constexpr (std::is_same_v<ValueType, Map>)
+                {
+                    /// It is not accurate calculations
+                    bytes_allocated += sizeof(Map) * container.size();
+                }
+                else if constexpr (std::is_same_v<ValueType, Object>)
+                {
+                    /// It is not accurate calculations
+                    bytes_allocated += sizeof(Object) * container.size();
                 }
                 else
                 {

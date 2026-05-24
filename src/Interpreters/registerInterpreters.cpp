@@ -1,10 +1,7 @@
-#include <mutex>
 #include <Interpreters/InterpreterFactory.h>
 
 namespace DB
 {
-
-std::once_flag global_register_once_flag;
 
 void registerInterpreterSelectQuery(InterpreterFactory & factory);
 void registerInterpreterSelectQueryAnalyzer(InterpreterFactory & factory);
@@ -41,6 +38,7 @@ void registerInterpreterCreateUserQuery(InterpreterFactory & factory);
 void registerInterpreterCreateRoleQuery(InterpreterFactory & factory);
 void registerInterpreterCreateQuotaQuery(InterpreterFactory & factory);
 void registerInterpreterCreateRowPolicyQuery(InterpreterFactory & factory);
+void registerInterpreterCreateMaskingPolicyQuery(InterpreterFactory & factory);
 void registerInterpreterCreateSettingsProfileQuery(InterpreterFactory & factory);
 void registerInterpreterDropAccessEntityQuery(InterpreterFactory & factory);
 void registerInterpreterMoveAccessEntityQuery(InterpreterFactory & factory);
@@ -107,6 +105,7 @@ void registerInterpreters()
     registerInterpreterCreateRoleQuery(factory);
     registerInterpreterCreateQuotaQuery(factory);
     registerInterpreterCreateRowPolicyQuery(factory);
+    registerInterpreterCreateMaskingPolicyQuery(factory);
     registerInterpreterCreateSettingsProfileQuery(factory);
     registerInterpreterDropAccessEntityQuery(factory);
     registerInterpreterMoveAccessEntityQuery(factory);

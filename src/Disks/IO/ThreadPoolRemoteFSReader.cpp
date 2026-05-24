@@ -55,15 +55,13 @@ namespace
         explicit AsyncReadIncrement(std::shared_ptr<AsyncReadCounters> counters_)
             : counters(counters_)
         {
-            std::lock_guard lock(counters->mutex);
-            if (++counters->current_parallel_read_tasks > counters->max_parallel_read_tasks)
-                counters->max_parallel_read_tasks = counters->current_parallel_read_tasks;
+            AsyncReadCounters::incrementAndUpdateMax(
+                counters->current_parallel_read_tasks, counters->max_parallel_read_tasks);
         }
 
         ~AsyncReadIncrement()
         {
-            std::lock_guard lock(counters->mutex);
-            --counters->current_parallel_read_tasks;
+            counters->current_parallel_read_tasks.fetch_sub(1, std::memory_order_relaxed);
         }
 
         std::shared_ptr<AsyncReadCounters> counters;
@@ -74,7 +72,7 @@ ThreadPoolRemoteFSReader::ThreadPoolRemoteFSReader(size_t pool_size, size_t queu
     : pool(std::make_unique<ThreadPool>(CurrentMetrics::ThreadPoolRemoteFSReaderThreads,
                                         CurrentMetrics::ThreadPoolRemoteFSReaderThreadsActive,
                                         CurrentMetrics::ThreadPoolRemoteFSReaderThreadsScheduled,
-                                        pool_size, 0, queue_size_))
+                                        pool_size, pool_size, queue_size_))
 {
 }
 

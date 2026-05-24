@@ -454,11 +454,7 @@ void Connection::sendHello()
                         "Parameters 'default_database', 'user' and 'password' must not contain ASCII control characters");
 
     writeVarUInt(Protocol::Client::Hello, *out);
-    /// writeStringBinary(std::string(VERSION_NAME) + " " + client_name, *out);
-    if (client_name.empty())
-        writeStringBinary("chDB", *out);
-    else
-        writeStringBinary("chDB " + client_name, *out);
+    writeStringBinary(std::string(VERSION_NAME) + " " + client_name, *out);
     writeVarUInt(VERSION_MAJOR, *out);
     writeVarUInt(VERSION_MINOR, *out);
     // NOTE For backward compatibility of the protocol, client cannot send its version_patch.
@@ -1121,7 +1117,7 @@ void Connection::sendClusterFunctionReadTaskResponse(const ClusterFunctionReadTa
 void Connection::sendMergeTreeReadTaskResponse(const ParallelReadResponse & response)
 {
     writeVarUInt(Protocol::Client::MergeTreeReadTaskResponse, *out);
-    response.serialize(*out, server_parallel_replicas_protocol_version);
+    response.serialize(*out, server_parallel_replicas_protocol_version, server_revision);
     out->finishChunk();
     out->next();
 }

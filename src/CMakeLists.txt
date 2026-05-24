@@ -71,6 +71,10 @@ add_subdirectory (Daemon)
 add_subdirectory (Loggers)
 add_subdirectory (Formats)
 
+if (ENABLE_EXAMPLES)
+    add_subdirectory (Examples)
+endif()
+
 if (OMIT_HEAVY_DEBUG_SYMBOLS)
     # Files inherited via extract_into_parent_list that would be marked to remove heavy symbols otherwise
     set_source_files_properties(
@@ -105,7 +109,7 @@ add_headers_and_sources(clickhouse_common_io IO/Protobuf)
 add_headers_and_sources(clickhouse_common_io IO/S3)
 add_headers_and_sources(clickhouse_common_io IO/AzureBlobStorage)
 add_headers_and_sources(clickhouse_common_io Disks/DiskObjectStorage/ObjectStorages/AzureBlobStorage)
-list (REMOVE_ITEM clickhouse_common_io_sources Common/malloc.cpp Common/stubFree.c Common/AllocationInterceptors.cpp)
+list (REMOVE_ITEM clickhouse_common_io_sources Common/malloc.cpp Common/AllocationInterceptors.cpp)
 list (REMOVE_ITEM clickhouse_common_io_sources Common/ExceptionExt.cpp)
 
 
@@ -217,24 +221,6 @@ endif ()
 
 add_library(clickhouse_common_io ${clickhouse_common_io_headers} ${clickhouse_common_io_sources})
 
-set_source_files_properties(Common/ThreadFuzzer.cpp PROPERTIES COMPILE_FLAGS "-fomit-frame-pointer -momit-leaf-frame-pointer")
-
-if (SPLIT_SHARED_LIBRARIES)
-    target_compile_definitions(clickhouse_common_io PRIVATE SPLIT_SHARED_LIBRARIES)
-endif ()
-
-if (ENABLE_JEMALLOC)
-    add_library (clickhouse_malloc OBJECT Common/stubFree.c Common/malloc.cpp)
-    set_source_files_properties(Common/stubFree.c PROPERTIES COMPILE_FLAGS "-Wno-reserved-identifier") # suppress warning about __wrap_ functions
-    if (TARGET ch_contrib::jemalloc)
-        target_link_libraries (clickhouse_malloc PRIVATE ch_contrib::jemalloc clickhouse_common_io)
-    endif()
-else()
-    add_library (clickhouse_malloc OBJECT Common/malloc.cpp)
-endif()
-
-set_source_files_properties(Common/malloc.cpp PROPERTIES COMPILE_FLAGS "-fno-builtin")
-
 if (ENABLE_CLICKHOUSE_DISTRIBUTED_CACHE)
     target_compile_definitions(clickhouse_common_io PUBLIC ENABLE_DISTRIBUTED_CACHE=1)
 else()
@@ -250,10 +236,25 @@ endif ()
 
 set_source_files_properties(Common/ThreadFuzzer.cpp PROPERTIES COMPILE_FLAGS "-fomit-frame-pointer -momit-leaf-frame-pointer")
 
-add_library (clickhouse_new_delete STATIC Common/AllocationInterceptors.cpp)
-if (ENABLE_JEMALLOC)
-    set_source_files_properties(Common/AllocationInterceptors.cpp PROPERTIES COMPILE_FLAGS "-Wno-reserved-identifier")
+# Arrow IPC buffers use intentionally unaligned int32 offset arrays — suppress the alignment check.
+# RocksDB EmbeddedRocksDB full scan hits a pointer-overflow when a corrupted slice size
+# causes pointer arithmetic to overflow. Pre-existing bug: https://github.com/ClickHouse/ClickHouse/issues/99862
+if (SANITIZE STREQUAL "address,undefined")
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/Processors/Formats/Impl/ArrowColumnToCHColumn.cpp
+        PROPERTIES COMPILE_FLAGS "-fno-sanitize=alignment")
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/Storages/RocksDB/StorageEmbeddedRocksDB.cpp
+        PROPERTIES COMPILE_FLAGS "-fno-sanitize=pointer-overflow")
+endif ()
+
+add_library (clickhouse_malloc OBJECT Common/malloc.cpp)
+set_source_files_properties(Common/malloc.cpp PROPERTIES COMPILE_FLAGS "-fno-builtin")
+if (TARGET ch_contrib::jemalloc)
+    target_link_libraries (clickhouse_malloc PRIVATE ch_contrib::jemalloc clickhouse_common_io)
 endif()
+
+add_library (clickhouse_new_delete STATIC Common/AllocationInterceptors.cpp)
 target_link_libraries (clickhouse_new_delete PRIVATE clickhouse_common_io)
 if (TARGET ch_contrib::jemalloc)
     target_link_libraries (clickhouse_new_delete PRIVATE ch_contrib::jemalloc)
@@ -301,17 +302,20 @@ add_object_library(clickhouse_analyzer_passes Analyzer/Resolve)
 add_object_library(clickhouse_planner Planner)
 add_object_library(clickhouse_interpreters Interpreters)
 add_object_library(clickhouse_interpreters_cache Interpreters/Cache)
+add_object_library(clickhouse_interpreters_filecache Interpreters/FileCache)
 add_object_library(clickhouse_interpreters_hash_join Interpreters/HashJoin)
 add_object_library(clickhouse_interpreters_access Interpreters/Access)
 add_object_library(clickhouse_interpreters_mysql Interpreters/MySQL)
 add_object_library(clickhouse_interpreters_clusterproxy Interpreters/ClusterProxy)
 add_object_library(clickhouse_interpreters_jit Interpreters/JIT)
 add_object_library(clickhouse_interpreters_wasm Interpreters/WebAssembly)
+add_object_library(clickhouse_interpreters_merge_tree_transaction Interpreters/MergeTreeTransaction)
 add_object_library(clickhouse_columns Columns)
 add_object_library(clickhouse_storages Storages)
 add_object_library(clickhouse_storages_mysql Storages/MySQL)
 add_object_library(clickhouse_storages_distributed Storages/Distributed)
 add_object_library(clickhouse_storages_mergetree Storages/MergeTree)
+add_object_library(clickhouse_storages_mergetree_unique_key Storages/MergeTree/UniqueKey)
 add_object_library(clickhouse_storages_mergetree_compaction Storages/MergeTree/Compaction)
 add_object_library(clickhouse_storages_mergetree_compaction_merge_predicates Storages/MergeTree/Compaction/MergePredicates)
 add_object_library(clickhouse_storages_mergetree_compaction_merge_selectors Storages/MergeTree/Compaction/MergeSelectors)
@@ -339,11 +343,62 @@ endif()
 
 add_object_library(clickhouse_server Server)
 add_object_library(clickhouse_server_http Server/HTTP)
+
+# Track dependencies for #embed directives so that changes to embedded files trigger recompilation.
+set_source_files_properties(Server/WebUIRequestHandler.cpp PROPERTIES OBJECT_DEPENDS
+    "${CMAKE_SOURCE_DIR}/programs/server/play.html;\
+${CMAKE_SOURCE_DIR}/programs/server/dashboard.html;\
+${CMAKE_SOURCE_DIR}/programs/server/js/uplot.js;\
+${CMAKE_SOURCE_DIR}/programs/server/js/lz-string.js;\
+${CMAKE_SOURCE_DIR}/programs/server/js/xterm.min.js;\
+${CMAKE_SOURCE_DIR}/programs/server/js/xterm.min.css;\
+${CMAKE_SOURCE_DIR}/programs/server/js/addon-fit.min.js;\
+${CMAKE_SOURCE_DIR}/programs/server/js/addon-web-links.min.js;\
+${CMAKE_SOURCE_DIR}/programs/server/binary.html;\
+${CMAKE_SOURCE_DIR}/programs/server/merges.html;\
+${CMAKE_SOURCE_DIR}/programs/server/jemalloc.html")
+
+set_source_files_properties(Server/IndexRequestHandler.cpp PROPERTIES OBJECT_DEPENDS
+    "${CMAKE_SOURCE_DIR}/programs/server/index.html")
+
+set_source_files_properties(Server/WebTerminalRequestHandler.cpp PROPERTIES OBJECT_DEPENDS
+    "${CMAKE_SOURCE_DIR}/programs/server/webterminal.html")
+
+set_source_files_properties(Server/KeeperDashboardRequestHandler.cpp PROPERTIES OBJECT_DEPENDS
+    "${CMAKE_SOURCE_DIR}/programs/keeper/dashboard.html")
+
+set_source_files_properties(Server/KeeperJemallocHandler.cpp PROPERTIES OBJECT_DEPENDS
+    "${CMAKE_SOURCE_DIR}/programs/server/jemalloc.html")
+
+# Common/FrequencyHolder.cpp embeds files from contrib/nlp-data/ via #embed.
+# Add OBJECT_DEPENDS only if the submodule is checked out.
+set(_nlp_charset "${CMAKE_SOURCE_DIR}/contrib/nlp-data/charset.zst")
+set(_nlp_tonality "${CMAKE_SOURCE_DIR}/contrib/nlp-data/tonality_ru.zst")
+if (EXISTS "${_nlp_charset}" AND EXISTS "${_nlp_tonality}")
+    set_source_files_properties(Common/FrequencyHolder.cpp PROPERTIES OBJECT_DEPENDS
+        "${_nlp_charset};${_nlp_tonality}")
+endif()
+
+set_source_files_properties(Storages/System/attachInformationSchemaTables.cpp PROPERTIES OBJECT_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/Storages/System/information_schema/schemata.sql;\
+${CMAKE_CURRENT_SOURCE_DIR}/Storages/System/information_schema/tables.sql;\
+${CMAKE_CURRENT_SOURCE_DIR}/Storages/System/information_schema/views.sql;\
+${CMAKE_CURRENT_SOURCE_DIR}/Storages/System/information_schema/columns.sql;\
+${CMAKE_CURRENT_SOURCE_DIR}/Storages/System/information_schema/key_column_usage.sql;\
+${CMAKE_CURRENT_SOURCE_DIR}/Storages/System/information_schema/referential_constraints.sql;\
+${CMAKE_CURRENT_SOURCE_DIR}/Storages/System/information_schema/statistics.sql;\
+${CMAKE_CURRENT_SOURCE_DIR}/Storages/System/information_schema/engines.sql;\
+${CMAKE_CURRENT_SOURCE_DIR}/Storages/System/information_schema/character_sets.sql;\
+${CMAKE_CURRENT_SOURCE_DIR}/Storages/System/information_schema/collations.sql")
+
 if (ENABLE_SSL)
     add_object_library(clickhouse_server_acme Server/ACME)
 endif()
 if (TARGET ch_contrib::ssh)
     add_object_library(clickhouse_server_ssh Server/SSH)
+endif()
+if (TARGET ch_contrib::arrow_flight)
+    add_object_library(clickhouse_server_arrowflight Server/ArrowFlight)
 endif()
 add_object_library(clickhouse_server_embedded_client Server/ClientEmbedded)
 add_object_library(clickhouse_formats Formats)
@@ -381,9 +436,7 @@ endif()
 add_library (dbms STATIC ${dbms_headers} ${dbms_sources})
 
 target_link_libraries (dbms PRIVATE ch_contrib::libdivide daemon)
-if (TARGET ch_contrib::clickstack_resources)
-    target_link_libraries (dbms PRIVATE ch_contrib::clickstack_resources)
-endif ()
+target_link_libraries (dbms PRIVATE ch_contrib::clickstack_resources)
 if (TARGET ch_contrib::jemalloc)
     target_link_libraries (dbms PRIVATE ch_contrib::jemalloc)
 endif()
@@ -414,7 +467,7 @@ target_link_libraries (clickhouse_common_io
         PUBLIC
             common
             ch_contrib::double_conversion
-            ch_contrib::dragonbox_to_chars
+            ch_contrib::zmij
             ch_contrib::libdivide
 )
 
@@ -537,7 +590,8 @@ target_link_libraries(
     dbms
     PUBLIC
         boost::circular_buffer
-        boost::heap)
+        boost::heap
+        boost::iostreams)
 
 target_link_libraries(clickhouse_common_io PUBLIC
     ch_contrib::miniselect
@@ -664,12 +718,6 @@ if (USE_ORC)
     target_include_directories(dbms SYSTEM BEFORE PUBLIC ${ORC_INCLUDE_DIR} "${PROJECT_BINARY_DIR}/contrib/orc/c++/include")
 endif ()
 
-if (USE_UTF8PROC)
-    target_link_libraries(dbms PUBLIC ch_contrib::utf8proc)
-    target_include_directories (clickhouse_common_io SYSTEM BEFORE PUBLIC ${UTF8PROC_INCLUDE_DIR})
-    message(STATUS "UTF8PROC_INCLUDE_DIR: ${UTF8PROC_INCLUDE_DIR}")
-endif()
-
 if (TARGET ch_contrib::rocksdb)
     target_link_libraries(dbms PUBLIC ch_contrib::rocksdb)
 endif()
@@ -687,8 +735,11 @@ target_link_libraries (clickhouse_common_io PRIVATE ch_contrib::lz4)
 target_link_libraries(clickhouse_common_io PUBLIC boost::context)
 target_link_libraries(dbms PUBLIC boost::context)
 
-if (ENABLE_NLP)
+if (TARGET ch_contrib::stemmer)
     target_link_libraries(dbms PUBLIC ch_contrib::stemmer)
+endif()
+
+if (ENABLE_NLP)
     target_link_libraries(dbms PUBLIC ch_contrib::wnb)
     target_link_libraries(dbms PUBLIC ch_contrib::lemmagen)
 endif()

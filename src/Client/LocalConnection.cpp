@@ -1,30 +1,31 @@
-#include <memory>
-#include <Client/ClientApplicationBase.h>
-#include <Client/ClientBase.h>
 #include <Client/LocalConnection.h>
+#include <memory>
+#include <Client/ClientBase.h>
+#include <Client/ClientApplicationBase.h>
 #include <Core/Protocol.h>
 #include <Core/Settings.h>
 #include <Interpreters/DatabaseCatalog.h>
-#include <Interpreters/InternalTextLogsQueue.h>
+#include <Interpreters/ProcessList.h>
 #include <Interpreters/executeQuery.h>
-#include <Parsers/ASTInsertQuery.h>
-#include <Parsers/Kusto/ParserKQLStatement.h>
-#include <Parsers/Kusto/parseKQLQuery.h>
-#include <Parsers/PRQL/ParserPRQLQuery.h>
-#include <Parsers/ParserQuery.h>
-#include <Parsers/Prometheus/ParserPrometheusQuery.h>
+#include <Processors/Formats/IInputFormat.h>
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/Executors/PullingAsyncPipelineExecutor.h>
 #include <Processors/Executors/PushingAsyncPipelineExecutor.h>
 #include <Processors/Executors/PushingPipelineExecutor.h>
-#include <Processors/Formats/IInputFormat.h>
 #include <Processors/Transforms/AddingDefaultsTransform.h>
-#include <QueryPipeline/Pipe.h>
 #include <QueryPipeline/QueryPipeline.h>
+#include <QueryPipeline/Pipe.h>
+#include <Parsers/ASTInsertQuery.h>
 #include <Storages/IStorage.h>
 #include <Common/config_version.h>
 #include <Common/ConcurrentBoundedQueue.h>
 #include <Common/CurrentThread.h>
+#include <Interpreters/InternalTextLogsQueue.h>
+#include <Parsers/ParserQuery.h>
+#include <Parsers/PRQL/ParserPRQLQuery.h>
+#include <Parsers/Kusto/ParserKQLStatement.h>
+#include <Parsers/Kusto/parseKQLQuery.h>
+#include <Parsers/Prometheus/ParserPrometheusQuery.h>
 
 namespace DB
 {
@@ -115,11 +116,6 @@ void LocalConnection::updateProgress(const Progress & value)
     state->progress.incrementPiecewiseAtomically(value);
 }
 
-void LocalConnection::updateCHDBProgress(const Progress & value)
-{
-    chdb_progress.incrementPiecewiseAtomically(value);
-}
-
 void LocalConnection::sendProfileEvents()
 {
     Block profile_block;
@@ -152,29 +148,33 @@ void LocalConnection::sendQuery(
 
     query_context->setCurrentQueryId(query_id);
     query_context->setClientInterface(ClientInfo::Interface::LOCAL);
-#if USE_PYTHON
-    query_context->setJSONSupport(session->isJSONSupported());
-    query_context->setPythonTableCache(session->getPythonTableCache());
-#endif
 
-    if (send_progress)
+    /// Always track progress so that output formats (e.g. JSON) can report accurate statistics.
+    /// The send_progress flag only controls the client-side progress bar, not progress tracking.
+    query_context->setProgressCallback([this](const Progress & value) { this->updateProgress(value); });
+    query_context->setFileProgressCallback([this](const FileProgress & value) { this->updateProgress(Progress(value)); });
+
+    if (is_cancelled_callback)
     {
-        query_context->setProgressCallback([this] (const Progress & value)
+        query_context->setInteractiveCancelCallback(
+            [this, check_cancelled = is_cancelled_callback, progress_callback = process_progress_callback]() -> bool
         {
-            this->updateProgress(value);
-            this->updateCHDBProgress(value);
+            /// Send accumulated progress to the client so the progress bar updates during analysis.
+            if (progress_callback)
+            {
+                auto progress = state->progress.fetchAndResetPiecewiseAtomically();
+                if (progress.read_rows || progress.read_bytes)
+                    progress_callback(progress);
+            }
+
+            if (!check_cancelled())
+                return false;
+
+            state->is_cancelled = true;
+            if (auto elem = query_context->getProcessListElement())
+                elem->cancelQuery(CancelReason::CANCELLED_BY_USER);
+            return true;
         });
-        query_context->setFileProgressCallback([this](const FileProgress & value)
-        {
-            const Progress progress(value);
-            this->updateProgress(progress);
-            this->updateCHDBProgress(progress);
-        });
-    }
-    else
-    {
-        query_context->setProgressCallback([this] (const Progress & value) { this->updateCHDBProgress(value); });
-        query_context->setFileProgressCallback([this](const FileProgress & value) { this->updateCHDBProgress(Progress(value)); });
     }
 
     /// Switch the database to the desired one (set by the USE query)
@@ -188,7 +188,6 @@ void LocalConnection::sendQuery(
 
     state.reset();
     state.emplace();
-    chdb_progress.reset();
 
     state->query_id = query_id;
     state->query = query;
@@ -216,7 +215,7 @@ void LocalConnection::sendQuery(
         if (context != query_context)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected context in Input initializer");
 
-        auto metadata_snapshot = input_storage->getInMemoryMetadataPtr();
+        auto metadata_snapshot = input_storage->getInMemoryMetadataPtr(context, false);
         Block sample = metadata_snapshot->getSampleBlock();
 
         next_packet_type = Protocol::Server::Data;
@@ -234,8 +233,7 @@ void LocalConnection::sendQuery(
         if (dialect == Dialect::kusto)
             parser = std::make_unique<ParserKQLStatement>(end, settings[Setting::allow_settings_after_format_in_insert]);
         else if (dialect == Dialect::prql)
-            parser = std::make_unique<ParserPRQLQuery>(
-                settings[Setting::max_query_size], settings[Setting::max_parser_depth], settings[Setting::max_parser_backtracks]);
+            parser = std::make_unique<ParserPRQLQuery>(settings[Setting::max_query_size], settings[Setting::max_parser_depth], settings[Setting::max_parser_backtracks]);
         else if (dialect == Dialect::promql)
             parser = std::make_unique<ParserPrometheusQuery>(settings[Setting::promql_database], settings[Setting::promql_table], Field{settings[Setting::promql_evaluation_time]});
         else
@@ -286,7 +284,9 @@ void LocalConnection::sendQuery(
         if (columns_description.hasDefaults())
         {
             pipe.addSimpleTransform([&](const SharedHeader & header)
-                                    { return std::make_shared<AddingDefaultsTransform>(header, columns_description, *source, context); });
+            {
+                return std::make_shared<AddingDefaultsTransform>(header, columns_description, *source, context);
+            });
         }
 
         state->input_pipeline = std::make_unique<QueryPipeline>(std::move(pipe));
@@ -457,6 +457,11 @@ bool LocalConnection::poll(size_t)
 
     if (state->exception)
     {
+        /// Flush any buffered logs before delivering the exception, otherwise
+        /// the user would not see log messages produced before the failure.
+        if (needSendLogs())
+            return true;
+
         next_packet_type = Protocol::Server::Exception;
         return true;
     }
@@ -580,6 +585,13 @@ bool LocalConnection::poll(size_t)
         }
     }
 
+    if (state->is_finished && !state->sent_progress)
+    {
+        state->sent_progress = true;
+        next_packet_type = Protocol::Server::Progress;
+        return true;
+    }
+
     if (state->is_finished)
     {
         if (needSendLogs())
@@ -600,7 +612,7 @@ bool LocalConnection::poll(size_t)
 
 bool LocalConnection::needSendProgressOrMetrics()
 {
-    if (send_progress && (state->after_send_progress.elapsedMicroseconds() >= query_context->getSettingsRef()[Setting::interactive_delay]))
+    if (state->after_send_progress.elapsedMicroseconds() >= query_context->getSettingsRef()[Setting::interactive_delay])
     {
         state->after_send_progress.restart();
         next_packet_type = Protocol::Server::Progress;
@@ -826,14 +838,6 @@ ServerConnectionPtr LocalConnection::createConnection(
 {
     return std::make_unique<LocalConnection>(std::move(session), in, send_progress, send_profile_events, server_display_name);
 }
-
-#if USE_PYTHON
-void LocalConnection::resetQueryContext()
-{
-    query_context.reset();
-    state.reset();
-}
-#endif
 
 
 }
