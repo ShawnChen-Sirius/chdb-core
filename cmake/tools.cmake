@@ -1,6 +1,6 @@
 # Compiler
 
-if (NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+if (NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     message (FATAL_ERROR "Compiler ${CMAKE_CXX_COMPILER_ID} is not supported. Please switch to Clang")
 endif ()
 
@@ -59,6 +59,8 @@ if (LINKER_NAME)
         message (FATAL_ERROR "Using linker ${LINKER_NAME} but can't find its path.")
     endif ()
     set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --ld-path=${LLD_PATH}")
+    set (CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} --ld-path=${LLD_PATH}")
+    set (CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} --ld-path=${LLD_PATH}")
 endif ()
 
 if (LINKER_NAME)
@@ -95,7 +97,9 @@ ch_find_program (OBJCOPY_PATH NAMES "llvm-objcopy-${COMPILER_VERSION_MAJOR}" "ll
 if (OBJCOPY_PATH)
     message (STATUS "Using objcopy: ${OBJCOPY_PATH}")
 else ()
-    message (FATAL_ERROR "Cannot find objcopy.")
+    # objcopy is only needed for split_debug_symbols (keeper), which is disabled in chdb builds.
+    # On macOS without Homebrew LLVM, llvm-objcopy is not shipped by Xcode CLT — downgrade to warning.
+    message (WARNING "Cannot find objcopy. Debug symbol splitting will be unavailable.")
 endif ()
 
 # nm (used by helper scripts that inspect symbol tables, e.g. cmake/localize_rust_c_symbols.sh)
@@ -120,10 +124,12 @@ if (OS_DARWIN AND NOT CMAKE_TOOLCHAIN_FILE)
     # available.
     find_program(GFIND_PATH NAMES "gfind")
     if (NOT GFIND_PATH)
-        message (FATAL_ERROR "GNU find not found. You can install it with 'brew install findutils'.")
+        # gfind/ggrep are only needed for the license-listing utility, not for compilation.
+        # Downgrade to warning so native macOS builds without Homebrew GNU userland can proceed.
+        message (WARNING "GNU find not found. License listing (utils/list-licenses) will be unavailable. Install with 'brew install findutils'.")
     endif()
     find_program(GGREP_PATH NAMES "ggrep")
     if (NOT GGREP_PATH)
-        message (FATAL_ERROR "GNU grep not found. You can install it with 'brew install grep'.")
+        message (WARNING "GNU grep not found. License listing (utils/list-licenses) will be unavailable. Install with 'brew install grep'.")
     endif()
 endif ()

@@ -119,6 +119,7 @@ public:
 
     static DatabaseCatalog & init(ContextMutablePtr global_context_);
     static DatabaseCatalog & instance();
+    static bool isAvailable();  /// Check if catalog is initialized and not being destroyed
     static void shutdown(std::function<void()> shutdown_system_logs);
 
     void createBackgroundTasks();
@@ -278,6 +279,9 @@ public:
     void updateMetadataFile(const String & database_name, const ASTPtr & create_query);
     bool hasDatalakeCatalogs() const;
     bool isDatalakeCatalog(const String & database_name) const;
+
+    /// chdb: chdb session query need to fix the path 
+    void fixPath(const String & path);
 
 private:
     // The global instance of database catalog. unique_ptr is to allow

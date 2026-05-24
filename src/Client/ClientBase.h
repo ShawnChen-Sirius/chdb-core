@@ -5,6 +5,7 @@
 #include <Client/ProgressTable.h>
 #include <Client/Suggest.h>
 #include <IO/CompressionMethod.h>
+#include <IO/Progress.h>
 #include <IO/WriteBuffer.h>
 #include <Common/DNSResolver.h>
 #include <Common/InterruptListener.h>
@@ -12,22 +13,33 @@
 #include <Common/QueryFuzzer.h>
 #include <Common/ShellCommand.h>
 #include <Common/Stopwatch.h>
+#include "base/types.h"
 #include <Core/ExternalTable.h>
+#include <Core/Settings.h>
 #include <Interpreters/Context.h>
+#include <Parsers/ASTCreateQuery.h>
+#include <Poco/ConsoleChannel.h>
+#include <Poco/SimpleFileChannel.h>
+#include <Poco/SplitterChannel.h>
+#include <Poco/Util/Application.h>
+
+
+#include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Storages/SelectQueryInfo.h>
 #include <Storages/StorageFile.h>
-
 #if USE_CLIENT_AI
-#include <Client/AI/AISQLGenerator.h>
+#    include <Client/AI/AISQLGenerator.h>
 #endif
-
 #include <boost/program_options.hpp>
 
 #include <atomic>
 #include <optional>
-#include <string_view>
 #include <string>
-
+#include <string_view>
+#include <mutex>
 #include <Poco/Util/LayeredConfiguration.h>
+
+#include <IO/WriteBufferFromVector.h>
 
 namespace po = boost::program_options;
 
@@ -79,6 +91,24 @@ class TerminalKeystrokeInterceptor;
 class WriteBufferFromFileDescriptor;
 struct Settings;
 struct MergeTreeSettings;
+class ThreadGroup;
+using ThreadGroupPtr = std::shared_ptr<ThreadGroup>;
+
+struct StreamingQueryContext
+{
+    String full_query;
+    ASTPtr parsed_query;
+    void * streaming_result = nullptr;
+    bool is_streaming_query = true;
+    ThreadGroupPtr thread_group = nullptr;
+
+    StreamingQueryContext() = default;
+};
+
+#if USE_PYTHON
+/// Function pointer type for creating custom output formats (e.g. DataFrame)
+using CustomOutputFormatCreator = std::function<std::shared_ptr<IOutputFormat>(SharedHeader, std::vector<Chunk> &)>;
+#endif
 
 /**
  * The base class which encapsulates the core functionality of a client.
@@ -92,6 +122,7 @@ class ClientBase
 {
 public:
     using Arguments = std::vector<String>;
+    using ProgressValuesCallback = std::function<void(const ProgressValues &, UInt64 elapsed_ns)>;
 
     explicit ClientBase
     (
@@ -107,6 +138,31 @@ public:
     bool tryStopQuery() { return query_interrupt_handler.tryStop(); }
     void stopQuery() { query_interrupt_handler.stop(); }
 
+    /// Steals and returns the query output vector.
+    /// Afterward, the content of query_result_memory is released by the Python side.
+    std::vector<char> * stealQueryOutputVector()
+    {
+        auto * result = query_result_memory;
+        query_result_memory = nullptr;
+        query_result_buf.reset();
+        return result;
+    }
+
+    void resetQueryOutputVector()
+    {
+        delete query_result_memory;
+        query_result_memory = nullptr;
+        query_result_buf.reset();
+    }
+
+    size_t getProcessedRows() const { return processed_rows_from_blocks; }
+    size_t getProcessedBytes() const { return processed_bytes_from_blocks; }
+    double getElapsedTime() const { return progress_indication.elapsedSeconds();}
+    std::string getErrorMsg() const { return error_message_oss.str(); }
+    void setDefaultFormat(const String & format);
+    void setBackground(bool is_background_) { is_background = is_background_; }
+    bool parseQueryTextWithOutputFormat(const String & query, const String & format);
+
     ASTPtr parseQuery(const char *& pos, const char * end, const Settings & settings, bool allow_multi_statements);
     /// Returns true if query succeeded
     bool processTextAsSingleQuery(const String & full_query);
@@ -115,9 +171,13 @@ public:
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Reconnection is not implemented");
     }
-protected:
+
+public:
     void runInteractive();
     void runNonInteractive();
+
+    bool is_background = false;
+    void runBackground();
 
     char * argv0 = nullptr;
     String app_name; /// Application name for help messages (e.g., "clickhouse client" or "clickhouse-client")
@@ -211,13 +271,22 @@ protected:
     /// Returns true if query processing was successful.
     bool processQueryText(const String & text);
 
+    bool processStreamingQuery(void * streaming_result_, bool is_canceled);
+    void resetOutputFormat();
+    void receiveResult(ASTPtr parsed_query, bool is_canceled);
+
     void setInsertionTable(const ASTInsertQuery & insert_query);
 
     /// Used to check certain things that are considered unsafe for the embedded client
     virtual bool isEmbeeddedClient() const = 0;
 
     static fs::path getHistoryFilePath();
-private:
+
+    void setProgressCallback(ProgressCallback callback);
+    bool hasProgressCallback() const;
+    void setProgressValuesCallback(ProgressValuesCallback callback);
+    bool hasProgressValuesCallback() const;
+
     void receiveResult(ASTPtr parsed_query, Int32 signals_before_stop, bool partial_result_on_first_cancel);
     bool receiveAndProcessPacket(ASTPtr parsed_query, bool cancelled_);
     void receiveLogsAndProfileEvents(ASTPtr parsed_query);
@@ -260,13 +329,12 @@ private:
 
     void startKeystrokeInterceptorIfExists();
     void stopKeystrokeInterceptorIfExists();
-
     /// Execute a query and collect all results as a single string (rows separated by newlines)
     /// Returns empty string on exception
     std::string executeQueryForSingleString(const std::string & query);
     virtual bool supportsLocalMetaCommands() const { return false; }
 
-protected:
+public:
 
     class QueryInterruptHandler : private boost::noncopyable
     {
@@ -310,10 +378,18 @@ protected:
 
     String appendSmileyIfNeeded(const String & prompt);
 
+#if USE_PYTHON
+    /// Set custom DataFrame format creator
+    static void setDataFrameFormatCreator(CustomOutputFormatCreator creator);
+
+    /// Get custom DataFrame format creator
+    static CustomOutputFormatCreator getDataFrameFormatCreator();
+#endif
+
     /// Should be one of the first, to be destroyed the last,
     /// since other members can use them.
     /// This holder may not be initialized in case if we run the client in the embedded mode (SSH).
-    SharedContextHolder shared_context;
+    SharedPtrContextHolder shared_context;
     ContextMutablePtr global_context;
     ContextMutablePtr client_context;
 
@@ -383,6 +459,11 @@ protected:
     std::unique_ptr<AutoCanceledWriteBuffer<WriteBufferFromFileDescriptor>> std_out;
     std::unique_ptr<ShellCommand> pager_cmd;
 
+    /// Output Buffer for query results.
+    std::vector<char> * query_result_memory = nullptr;
+    std::shared_ptr<WriteBuffer> query_result_buf;
+    std::shared_ptr<StreamingQueryContext> streaming_query_context;
+
     /// The user can specify to redirect query output to a file.
     std::unique_ptr<WriteBuffer> out_file_buf;
     std::shared_ptr<IOutputFormat> output_format;
@@ -415,6 +496,12 @@ protected:
     /// Replayed into output_format once it's available.
     Progress pending_progress;
     ProgressTable progress_table;
+    mutable std::mutex progress_callback_mutex;
+    ProgressCallback progress_callback;
+    mutable std::mutex progress_values_callback_mutex;
+    ProgressValuesCallback progress_values_callback;
+    mutable std::mutex progress_values_accumulated_mutex;
+    Progress progress_values_accumulated;
     bool need_render_progress = true;
     bool need_render_progress_table = true;
     bool progress_table_toggle_enabled = true;
@@ -424,7 +511,9 @@ protected:
     /// How many rows have been read or written. `processed_rows_from_blocks` does not increment when data does not flow through client,
     /// like with `INSERT ... SELECT`. We can use progress reports by server in that case to track processed rows.
     size_t processed_rows_from_blocks = 0;
+    size_t processed_bytes_from_blocks = 0;
     size_t processed_rows_from_progress = 0;
+    std::stringstream error_message_oss; /// error message stringstream
 
     bool print_stack_trace = false;
     /// The last exception that was received from the server. Is used for the
@@ -496,6 +585,12 @@ protected:
     std::ostream & output_stream;
     std::ostream & error_stream;
 
+    /// Always present to guarantee sizeof(ClientBase) is identical in USE_PYTHON=0 and USE_PYTHON=1
+    /// builds. src/Client/ is compiled without USE_PYTHON=1 while programs/local/ is compiled with it;
+    /// a sizeof difference causes vtable thunk offsets in ClientApplicationBase to disagree → SIGSEGV.
+    /// Chunk and SharedHeader are core types available in all builds.
+    std::vector<Chunk> collected_chunks;
+    SharedHeader collected_chunks_header;
 };
 
 }

@@ -936,8 +936,9 @@ void DatabaseCatalog::addUUIDMapping(const UUID & uuid, const DatabasePtr & data
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Mapping for table with UUID={} already exists", uuid);
     /// Normally this should never happen, but it's possible when the same UUIDs are explicitly specified in different CREATE queries,
     /// so it's not LOGICAL_ERROR
-    throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS, "Mapping for table with UUID={} already exists. It happened due to UUID collision, "
-                    "most likely because some not random UUIDs were manually specified in CREATE queries.", uuid);
+    /// chDB: No exception if table uuid exist for stateful query
+    // throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS, "Mapping for table with UUID={} already exists. It happened due to UUID collision, "
+    //                 "most likely because some not random UUIDs were manually specified in CREATE queries.", uuid);
 }
 
 void DatabaseCatalog::removeUUIDMapping(const UUID & uuid)
@@ -1018,6 +1019,11 @@ DatabaseCatalog & DatabaseCatalog::instance()
     return *database_catalog;
 }
 
+bool DatabaseCatalog::isAvailable()
+{
+    return database_catalog != nullptr;
+}
+
 void DatabaseCatalog::shutdown(std::function<void()> shutdown_system_logs)
 {
     auto compoment_guard = Coordination::setCurrentComponent("DatabaseCatalog::shutdown");
@@ -1027,6 +1033,8 @@ void DatabaseCatalog::shutdown(std::function<void()> shutdown_system_logs)
     {
         database_catalog->shutdownImpl(std::move(shutdown_system_logs));
     }
+
+    database_catalog.reset();
 }
 
 DatabasePtr DatabaseCatalog::getDatabase(const String & database_name, ContextPtr local_context) const
@@ -2148,6 +2156,12 @@ void DatabaseCatalog::startReplicatedDDLQueries()
 bool DatabaseCatalog::canPerformReplicatedDDLQueries() const
 {
     return replicated_ddl_queries_enabled;
+}
+
+/// chdb: chdb session query need to fix the path.
+void DatabaseCatalog::fixPath(const String & path)
+{
+    getContext()->setPath(path);
 }
 
 static void maybeUnlockUUID(UUID uuid)

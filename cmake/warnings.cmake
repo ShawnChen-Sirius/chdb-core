@@ -58,3 +58,9 @@ endif ()
 # Note: right now cmake 4.2.1 does not recognize "set (CMAKE_C_STANDARD 2y)"
 no_warning(c2y-extensions)
 no_warning(c23-extensions) # For #embed
+no_warning(unique-object-duplication) # Static locals in inline/static fns with hidden visibility; linker deduplicates via comdat
+
+# Apple Clang can treat /usr/local/include as poisoned when mixed with -isystem (e.g. bundled PCRE in Poco).
+if (OS_DARWIN)
+    no_warning (poison-system-directories)
+endif ()

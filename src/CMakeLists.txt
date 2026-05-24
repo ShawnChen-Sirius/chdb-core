@@ -109,7 +109,7 @@ add_headers_and_sources(clickhouse_common_io IO/Protobuf)
 add_headers_and_sources(clickhouse_common_io IO/S3)
 add_headers_and_sources(clickhouse_common_io IO/AzureBlobStorage)
 add_headers_and_sources(clickhouse_common_io Disks/DiskObjectStorage/ObjectStorages/AzureBlobStorage)
-list (REMOVE_ITEM clickhouse_common_io_sources Common/malloc.cpp Common/AllocationInterceptors.cpp)
+list (REMOVE_ITEM clickhouse_common_io_sources Common/malloc.cpp Common/stubFree.c Common/AllocationInterceptors.cpp)
 list (REMOVE_ITEM clickhouse_common_io_sources Common/ExceptionExt.cpp)
 
 
@@ -221,6 +221,24 @@ endif ()
 
 add_library(clickhouse_common_io ${clickhouse_common_io_headers} ${clickhouse_common_io_sources})
 
+set_source_files_properties(Common/ThreadFuzzer.cpp PROPERTIES COMPILE_FLAGS "-fomit-frame-pointer -momit-leaf-frame-pointer")
+
+if (SPLIT_SHARED_LIBRARIES)
+    target_compile_definitions(clickhouse_common_io PRIVATE SPLIT_SHARED_LIBRARIES)
+endif ()
+
+if (ENABLE_JEMALLOC)
+    add_library (clickhouse_malloc OBJECT Common/stubFree.c Common/malloc.cpp)
+    set_source_files_properties(Common/stubFree.c PROPERTIES COMPILE_FLAGS "-Wno-reserved-identifier") # suppress warning about __wrap_ functions
+    if (TARGET ch_contrib::jemalloc)
+        target_link_libraries (clickhouse_malloc PRIVATE ch_contrib::jemalloc clickhouse_common_io)
+    endif()
+else()
+    add_library (clickhouse_malloc OBJECT Common/malloc.cpp)
+endif()
+
+set_source_files_properties(Common/malloc.cpp PROPERTIES COMPILE_FLAGS "-fno-builtin")
+
 if (ENABLE_CLICKHOUSE_DISTRIBUTED_CACHE)
     target_compile_definitions(clickhouse_common_io PUBLIC ENABLE_DISTRIBUTED_CACHE=1)
 else()
@@ -248,13 +266,10 @@ if (SANITIZE STREQUAL "address,undefined")
         PROPERTIES COMPILE_FLAGS "-fno-sanitize=pointer-overflow")
 endif ()
 
-add_library (clickhouse_malloc OBJECT Common/malloc.cpp)
-set_source_files_properties(Common/malloc.cpp PROPERTIES COMPILE_FLAGS "-fno-builtin")
-if (TARGET ch_contrib::jemalloc)
-    target_link_libraries (clickhouse_malloc PRIVATE ch_contrib::jemalloc clickhouse_common_io)
-endif()
-
 add_library (clickhouse_new_delete STATIC Common/AllocationInterceptors.cpp)
+if (ENABLE_JEMALLOC)
+    set_source_files_properties(Common/AllocationInterceptors.cpp PROPERTIES COMPILE_FLAGS "-Wno-reserved-identifier")
+endif()
 target_link_libraries (clickhouse_new_delete PRIVATE clickhouse_common_io)
 if (TARGET ch_contrib::jemalloc)
     target_link_libraries (clickhouse_new_delete PRIVATE ch_contrib::jemalloc)
@@ -364,9 +379,6 @@ set_source_files_properties(Server/IndexRequestHandler.cpp PROPERTIES OBJECT_DEP
 set_source_files_properties(Server/WebTerminalRequestHandler.cpp PROPERTIES OBJECT_DEPENDS
     "${CMAKE_SOURCE_DIR}/programs/server/webterminal.html")
 
-set_source_files_properties(Server/KeeperDashboardRequestHandler.cpp PROPERTIES OBJECT_DEPENDS
-    "${CMAKE_SOURCE_DIR}/programs/keeper/dashboard.html")
-
 set_source_files_properties(Server/KeeperJemallocHandler.cpp PROPERTIES OBJECT_DEPENDS
     "${CMAKE_SOURCE_DIR}/programs/server/jemalloc.html")
 
@@ -436,7 +448,9 @@ endif()
 add_library (dbms STATIC ${dbms_headers} ${dbms_sources})
 
 target_link_libraries (dbms PRIVATE ch_contrib::libdivide daemon)
-target_link_libraries (dbms PRIVATE ch_contrib::clickstack_resources)
+if (TARGET ch_contrib::clickstack_resources)
+    target_link_libraries (dbms PRIVATE ch_contrib::clickstack_resources)
+endif ()
 if (TARGET ch_contrib::jemalloc)
     target_link_libraries (dbms PRIVATE ch_contrib::jemalloc)
 endif()
@@ -717,6 +731,12 @@ if (USE_ORC)
     target_link_libraries(dbms PUBLIC ${ORC_LIBRARIES})
     target_include_directories(dbms SYSTEM BEFORE PUBLIC ${ORC_INCLUDE_DIR} "${PROJECT_BINARY_DIR}/contrib/orc/c++/include")
 endif ()
+
+if (USE_UTF8PROC)
+    target_link_libraries(dbms PUBLIC ch_contrib::utf8proc)
+    target_include_directories (clickhouse_common_io SYSTEM BEFORE PUBLIC ${UTF8PROC_INCLUDE_DIR})
+    message(STATUS "UTF8PROC_INCLUDE_DIR: ${UTF8PROC_INCLUDE_DIR}")
+endif()
 
 if (TARGET ch_contrib::rocksdb)
     target_link_libraries(dbms PUBLIC ch_contrib::rocksdb)

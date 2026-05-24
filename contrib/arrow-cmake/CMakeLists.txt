@@ -29,6 +29,7 @@ if(NOT DEFINED CMAKE_C_STANDARD)
   set(CMAKE_C_STANDARD 11)
 endif()
 
+
 # This ensures that a standard higher than the minimum can be passed correctly
 if(NOT DEFINED CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 20)
@@ -216,6 +217,9 @@ target_include_directories(_orc SYSTEM BEFORE PUBLIC
 target_compile_options(_orc PRIVATE
     -include "${ClickHouse_SOURCE_DIR}/contrib/google-protobuf/src/google/protobuf/stubs/port.h"
 )
+if (TARGET ch_contrib::jemalloc)
+    target_link_libraries(_orc PRIVATE ch_contrib::jemalloc)
+endif ()
 target_include_directories(_orc SYSTEM BEFORE PUBLIC ${ORC_BUILD_INCLUDE_DIR})
 target_include_directories(_orc SYSTEM PRIVATE
     ${ORC_SOURCE_SRC_DIR}
@@ -464,11 +468,14 @@ set(ARROW_SRCS
         "${ARROW_SRC_DIR}/arrow/adapters/orc/options.cc"
         )
 
+
 add_definitions(-DARROW_WITH_BROTLI)
 SET(ARROW_SRCS "${LIBRARY_DIR}/util/compression_brotli.cc" ${ARROW_SRCS})
 
-add_definitions(-DARROW_WITH_BZ2)
-SET(ARROW_SRCS "${LIBRARY_DIR}/util/compression_bz2.cc" ${ARROW_SRCS})
+if (TARGET ch_contrib::bzip2)
+    add_definitions(-DARROW_WITH_BZ2)
+    SET(ARROW_SRCS "${LIBRARY_DIR}/util/compression_bz2.cc" ${ARROW_SRCS})
+endif()
 
 add_definitions(-DARROW_WITH_LZ4)
 SET(ARROW_SRCS "${LIBRARY_DIR}/util/compression_lz4.cc" ${ARROW_SRCS})
@@ -481,6 +488,74 @@ SET(ARROW_SRCS "${LIBRARY_DIR}/util/compression_zlib.cc" ${ARROW_SRCS})
 
 add_definitions(-DARROW_WITH_ZSTD)
 SET(ARROW_SRCS "${LIBRARY_DIR}/util/compression_zstd.cc" ${ARROW_SRCS})
+
+if (TARGET ch_contrib::jemalloc)
+    set (ARROW_JEMALLOC ON)
+    add_definitions(-DARROW_JEMALLOC=1)
+    message(STATUS "Using jemalloc in arrow lib (je_-prefix compatibility shim)")
+
+    # Arrow v23 calls unprefixed jemalloc extended API (mallocx, mallctl, …).
+    # ClickHouse builds jemalloc with --with-jemalloc-prefix=je_, so those
+    # symbols are exported as je_mallocx, je_mallctl, etc.
+    # We generate a thin shim header and force-include it only for this source
+    # file so that the rest of the build is not affected.
+    set(ARROW_JEMALLOC_COMPAT_HDR "${CMAKE_CURRENT_BINARY_DIR}/jemalloc_arrow_compat.h")
+    file(WRITE "${ARROW_JEMALLOC_COMPAT_HDR}" [[
+#pragma once
+/* Map Arrow's unprefixed jemalloc extended API to ClickHouse's je_-prefixed symbols.
+ *
+ * ClickHouse builds jemalloc with --with-jemalloc-prefix=je_ and propagates
+ * -DJEMALLOC_NO_RENAME to all consumers via target_compile_definitions INTERFACE.
+ * JEMALLOC_NO_RENAME suppresses the jemalloc_rename.h aliases that would have
+ * mapped je_XXX → XXX, so Arrow's calls to unprefixed names (mallocx, mallctl,
+ * malloc_stats_print …) are undefined.  This shim restores the mapping in the
+ * opposite direction: unprefixed → je_-prefixed, but only when renaming has
+ * been explicitly suppressed (JEMALLOC_NO_RENAME), which is exactly when the
+ * je_-prefix symbols are the canonical names. */
+#include <jemalloc/jemalloc.h>
+#ifdef JEMALLOC_NO_RENAME
+#  ifndef mallocx
+#    define mallocx            je_mallocx
+#  endif
+#  ifndef rallocx
+#    define rallocx            je_rallocx
+#  endif
+#  ifndef xallocx
+#    define xallocx            je_xallocx
+#  endif
+#  ifndef sallocx
+#    define sallocx            je_sallocx
+#  endif
+#  ifndef dallocx
+#    define dallocx            je_dallocx
+#  endif
+#  ifndef sdallocx
+#    define sdallocx           je_sdallocx
+#  endif
+#  ifndef nallocx
+#    define nallocx            je_nallocx
+#  endif
+#  ifndef mallctl
+#    define mallctl            je_mallctl
+#  endif
+#  ifndef mallctlnametomib
+#    define mallctlnametomib   je_mallctlnametomib
+#  endif
+#  ifndef mallctlbymib
+#    define mallctlbymib       je_mallctlbymib
+#  endif
+#  ifndef malloc_stats_print
+#    define malloc_stats_print je_malloc_stats_print
+#  endif
+#endif /* JEMALLOC_NO_RENAME */
+]])
+
+    set_source_files_properties(
+        "${LIBRARY_DIR}/memory_pool_jemalloc.cc"
+        PROPERTIES COMPILE_OPTIONS "-include;${ARROW_JEMALLOC_COMPAT_HDR}"
+    )
+    SET(ARROW_SRCS "${LIBRARY_DIR}/memory_pool_jemalloc.cc" ${ARROW_SRCS})
+endif()
 
 
 add_library(_arrow ${ARROW_SRCS})
@@ -498,15 +573,19 @@ target_link_libraries(_arrow PRIVATE
     ch_contrib::zlib
     ch_contrib::zstd
     ch_contrib::brotli
-    ch_contrib::bzip2
+    $<$<TARGET_EXISTS:ch_contrib::bzip2>:ch_contrib::bzip2>
     ch_contrib::curl
+    $<$<TARGET_EXISTS:ch_contrib::jemalloc>:ch_contrib::jemalloc>
 )
+
 target_link_libraries(_arrow PUBLIC _orc)
 
 add_dependencies(_arrow protoc)
 
 target_include_directories(_arrow SYSTEM BEFORE PUBLIC ${ARROW_SRC_DIR})
 target_include_directories(_arrow SYSTEM BEFORE PUBLIC "${ClickHouse_SOURCE_DIR}/contrib/arrow-cmake/cpp/src")
+
+target_include_directories(_arrow SYSTEM PRIVATE ${ARROW_SRC_DIR})
 
 target_include_directories(_arrow SYSTEM PRIVATE ${HDFS_INCLUDE_DIR})
 
@@ -593,7 +672,9 @@ target_link_libraries(_parquet
         boost::headers_only
         boost::regex
         OpenSSL::Crypto OpenSSL::SSL
-        ch_contrib::rapidjson)
+        ch_contrib::rapidjson
+        $<$<TARGET_EXISTS:ch_contrib::jemalloc>:ch_contrib::jemalloc>)
+
 
 if (SANITIZE STREQUAL "undefined" OR SANITIZE STREQUAL "address,undefined")
     target_compile_options(_parquet PRIVATE -fno-sanitize=undefined)

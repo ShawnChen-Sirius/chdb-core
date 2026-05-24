@@ -45,6 +45,8 @@ thread_local size_t terminate_current_exception_trace_size = 0;
 using namespace DB;
 
 
+std::atomic<bool> HandledSignals::disable_signal_handlers = false;
+
 static std::atomic_bool is_crashed = false;
 static_assert(std::atomic_bool::is_always_lock_free, "is_crashed must be lock-free for use in signal handlers");
 bool isCrashed() { return is_crashed.load(std::memory_order_relaxed); }
@@ -695,6 +697,8 @@ void HandledSignals::reset(bool close_pipe)
         }
     }
 
+    handled_signals.clear();
+
     if (close_pipe)
         signal_pipe.close();
 }
@@ -724,6 +728,9 @@ void HandledSignals::setupTerminateHandler()
 
 void HandledSignals::setupCommonDeadlySignalHandlers()
 {
+    if (disable_signal_handlers.load(std::memory_order_relaxed))
+        return;
+
     /// SIGTSTP is added for debugging purposes. To output a stack trace of any running thread at anytime.
     /// NOTE: that it is also used by clickhouse-test wrapper
     addSignalHandler({SIGABRT, SIGSEGV, SIGILL, SIGBUS, SIGSYS, SIGFPE, SIGTSTP, SIGTRAP}, signalHandler, true);
@@ -735,5 +742,8 @@ void HandledSignals::setupCommonDeadlySignalHandlers()
 
 void HandledSignals::setupCommonTerminateRequestSignalHandlers()
 {
+    if (disable_signal_handlers.load(std::memory_order_relaxed))
+        return;
+
     addSignalHandler({SIGINT, SIGQUIT, SIGTERM}, terminateRequestedSignalHandler, true);
 }

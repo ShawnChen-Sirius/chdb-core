@@ -198,3 +198,93 @@ tests/casa_del_dolor/_instances*
 ci/praktika/json_test.html
 ci/praktika/json_test.html.gz
 ci/praktika/json.html.gz
+
+# chDB: add additional files for chDB
+# Temporary and binary files
+*.py[cod]
+*.cfg
+!.isort.cfg
+!setup.cfg
+*.orig
+*.log
+*.pot
+__pycache__/*
+.cache/*
+.*.swp
+*/.ipynb_checkpoints/*
+
+# Project files
+.ropeproject
+.project
+.pydevproject
+.settings
+.idea
+.vscode
+tags
+
+# Package files
+*.egg
+*.eggs/
+.installed.cfg
+*.egg-info
+
+# Unittest and coverage
+htmlcov/*
+.coverage
+.coverage.*
+.tox
+junit*.xml
+coverage.xml
+.pytest_cache/
+
+# Build and docs folder/files
+build/*
+dist/*
+sdist/*
+docs/api/*
+docs/_rst/*
+docs/_build/*
+cover/*
+MANIFEST
+
+# Per-project virtualenvs
+.venv*/
+.conda*/
+.python-version
+
+*.parquet
+*.arrow
+.cursorignore
+/python_pkg/
+minitest/
+/tmps
+/bak
+*state_tmp_*
+/chdb-0.*/
+*.strings
+/arrow1100
+test_main
+/build*
+/bench
+/tests/data
+/examples/chdbStub
+/examples/chdbSimple
+/examples/chdbCppBasic
+/examples/chdbCppAdvanced
+/examples/chdbCppErrorHandling
+/examples/chdbCppStreaming
+/examples/:memory:
+/examples/chdbDlopen
+libchdb.so
+*.gz
+*.bz2
+*.tgz
+/examples/ml-25m
+.clickhouse/
+
+.chdb-build-bin/
+
+# Large test data files
+data.csv
+organizations-500000.*
+tests/organizations-500000.*

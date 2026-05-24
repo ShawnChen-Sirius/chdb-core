@@ -18,6 +18,7 @@ namespace DB
 namespace Setting
 {
     extern const SettingsBool allow_ddl;
+    extern const SettingsBool allow_python_table_function;
     extern const SettingsBool dynamic_disk_allow_from_env;
     extern const SettingsBool dynamic_disk_allow_include;
     extern const SettingsBool dynamic_disk_allow_from_zk;
@@ -470,6 +471,9 @@ SettingsConstraints::Checker SettingsConstraints::getChecker(const Settings & cu
     auto resolved_name = resolveSettingNameWithCache(setting_name);
     if (!current_settings[Setting::allow_ddl] && resolved_name == "allow_ddl")
         return Checker(PreformattedMessage::create("Cannot modify 'allow_ddl' setting when DDL queries are prohibited for the user"),
+                       ErrorCodes::QUERY_IS_PROHIBITED);
+    if (!current_settings[Setting::allow_python_table_function] && resolved_name == "allow_python_table_function")
+        return Checker(PreformattedMessage::create("Cannot modify 'allow_python_table_function' setting when Python table function is disabled for the user"),
                        ErrorCodes::QUERY_IS_PROHIBITED);
 
     /** The `readonly` value is understood as follows:
