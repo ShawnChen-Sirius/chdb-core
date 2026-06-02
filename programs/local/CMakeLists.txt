@@ -3,6 +3,7 @@ set (CLICKHOUSE_LOCAL_SOURCES
     ArrowSchema.cpp
     ArrowStreamWrapper.cpp
     ArrowTableReader.cpp
+    ChunkCollectorOutputFormat.cpp
     LocalServer.cpp
     EmbeddedServer.cpp
     ChdbClient.cpp
@@ -11,6 +12,7 @@ set (CLICKHOUSE_LOCAL_SOURCES
 if (NOT USE_PYTHON)
     set (CHDB_ARROW_SOURCES
         chdb-arrow.cpp
+        chdb-arrow-output.cpp
         ArrowStreamSource.cpp
         StorageArrowStream.cpp
         TableFunctionArrowStream.cpp
@@ -29,7 +31,6 @@ if (USE_PYTHON)
 
     set (CHDB_SOURCES
         chdb.cpp
-        ChunkCollectorOutputFormat.cpp
         FieldToPython.cpp
         ListScan.cpp
         LocalChdb.cpp

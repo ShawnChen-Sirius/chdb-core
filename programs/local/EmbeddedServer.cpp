@@ -1,8 +1,8 @@
 #include "EmbeddedServer.h"
 
+#include "ChunkCollectorOutputFormat.h"
 #if USE_PYTHON
 #include "TableFunctionPython.h"
-#include "ChunkCollectorOutputFormat.h"
 #else
 #include "StorageArrowStream.h"
 #include "TableFunctionArrowStream.h"
@@ -620,9 +620,8 @@ try
 
             registerDatabases();
             registerStorages();
-#if USE_PYTHON
             CHDB::registerDataFrameOutputFormat();
-#else
+#if !USE_PYTHON
             auto & storage_factory = StorageFactory::instance();
             registerStorageArrowStream(storage_factory);
 #endif
