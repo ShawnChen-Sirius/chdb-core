@@ -37,7 +37,9 @@ if [ "$(uname)" == "Darwin" ]; then
     UNWIND="-DUSE_UNWIND=0"
     JEMALLOC="-DENABLE_JEMALLOC=0"
     HDFS="-DENABLE_HDFS=0 -DENABLE_GSASL_LIBRARY=0 -DENABLE_KRB5=0"
-    MYSQL="-DENABLE_MYSQL=0"
+    # MySQL is kept ENABLED on macOS (default ${MYSQL}=-DENABLE_MYSQL=1). It was
+    # historically disabled here as a build workaround (commit c267c3f "Fix build
+    # issues", 2023) and never revisited; we re-enable it on all platforms.
     ICU="-DENABLE_ICU=0"
     SED_INPLACE="sed -i ''"
     # if Darwin ARM64 (M1, M2), disable AVX
@@ -133,6 +135,8 @@ else
     -DENABLE_LDAP=0 \
     -DENABLE_CLIENT_AI=1 \
     ${MYSQL} \
+    -DUSE_MONGODB=1 \
+    -DENABLE_USEARCH=1 -DENABLE_SIMSIMD=1 \
     ${HDFS} \
     -DENABLE_LIBRARIES=0 -DENABLE_SQIDS=1 ${RUST_FEATURES} \
     ${GLIBC_COMPATIBILITY} \

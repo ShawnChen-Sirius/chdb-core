@@ -98,7 +98,8 @@ UNWIND="-DUSE_UNWIND=0"
 JEMALLOC="-DENABLE_JEMALLOC=0"
 PYINIT_ENTRY="-Wl,-exported_symbol,_PyInit_${CHDB_PY_MOD}"
 HDFS="-DENABLE_HDFS=0 -DENABLE_GSASL_LIBRARY=0 -DENABLE_KRB5=0"
-MYSQL="-DENABLE_MYSQL=0"
+# MySQL enabled for macOS cross-build (was historically disabled, see build.sh).
+MYSQL="-DENABLE_MYSQL=1"
 ICU="-DENABLE_ICU=0"
 SED_INPLACE="sed -i"
 LLVM="-DENABLE_EMBEDDED_COMPILER=0 -DENABLE_DWARF_PARSER=0"
@@ -158,6 +159,8 @@ else
     -DENABLE_LDAP=0 \
     -DENABLE_CLIENT_AI=1 \
     ${MYSQL} \
+    -DUSE_MONGODB=1 \
+    -DENABLE_USEARCH=1 -DENABLE_SIMSIMD=1 \
     ${HDFS} \
     -DENABLE_LIBRARIES=0 -DENABLE_SQIDS=1 ${RUST_FEATURES} \
     ${GLIBC_COMPATIBILITY} \
@@ -221,20 +224,12 @@ if [ "${CHDB_LITE}" != "1" ]; then
         ${SED_INPLACE} 's/ '${CHDB_PY_MODULE}'/ '${LIBCHDB_SO}'/g' CMakeFiles/libchdb.rsp
     fi
 
-    # Control exported symbols for libchdb.so — must mirror the native macOS
-    # build (chdb/build.sh) exactly. The old code here only injected four
-    # -Wl,-exported_symbol flags by replacing ${PYINIT_ENTRY}, but the libchdb
-    # link command is derived from the `clickhouse` link line and never carries
-    # ${PYINIT_ENTRY}, so that sed was a no-op: NO symbols were restricted and
-    # the cross-compiled libchdb.so exported its entire transitive closure
-    # (~100k symbols incl. all of bundled abseil/protobuf). When such a
-    # libchdb.so is dlopen'd into a process that already imported a library
-    # carrying its own abseil/protobuf (e.g. pyarrow), libchdb's protobuf
-    # AddDescriptors -> absl OnShutdownRun static initializer binds to the
-    # foreign, already-initialized absl mutex and spins forever
-    # ("[mutex.cc:452] RAW: Lock blocking"). Restricting exports to the
-    # libchdb_export_macos.txt allow-list hides abseil/protobuf and removes the
-    # collision (the native build, which already uses this list, never hangs).
+    # Restrict libchdb.so exports to the C-ABI allow-list, same as the native
+    # build (chdb/build.sh). This must hide the bundled abseil/protobuf: if they
+    # stay exported, dyld coalesces them with another module's copy (e.g.
+    # pyarrow) and libchdb's protobuf static-init deadlocks on a foreign absl
+    # mutex. To expose a new C-ABI symbol, add it to libchdb_export_macos.txt
+    # (never widen exports here).
     LIBCHDB_CMD="${LIBCHDB_CMD} -Wl,-exported_symbols_list,${CHDB_DIR}/libchdb_export_macos.txt"
 
     LIBCHDB_CMD=$(echo ${LIBCHDB_CMD} | sed 's/@CMakeFiles\/clickhouse.rsp/@CMakeFiles\/libchdb.rsp/g')
