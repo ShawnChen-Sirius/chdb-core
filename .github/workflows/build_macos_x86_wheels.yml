@@ -393,6 +393,8 @@ jobs:
               echo "=============================================="
               pyenv shell $version
               python -m pip install dist/*.whl "$PANDAS_CONSTRAINT" --force-reinstall
+              # ADBC driver tests (tests/test_adbc_driver.py) load libchdb via the standard driver manager
+              python -c "import adbc_driver_manager" 2>/dev/null || python -m pip install -q adbc-driver-manager==1.8.0
               echo "Installed pandas version:"
               python -c "import pandas; print(pandas.__version__)"
               python -c "import chdb; res = chdb.query('select 1112222222,555', 'CSV'); print(f'Python $version: {res}')"
@@ -677,14 +679,15 @@ jobs:
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
-      - name: Upload chdb-core-lite to pypi
-        if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, 'rc')
-        run: |
-          export PATH="$HOME/.pyenv/bin:$PATH"
-          eval "$(pyenv init -)"
-          pyenv shell 3.9
-          python -m twine upload dist/chdb_core_lite-*.whl
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
-      # Free-threading wheels live in .github/workflows/build_ft_wheels.yml.
+      # NOTE: chdb-core-lite PyPI publishing temporarily disabled; uncomment to re-enable.
+      # - name: Upload chdb-core-lite to pypi
+      #   if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, 'rc')
+      #   run: |
+      #     export PATH="$HOME/.pyenv/bin:$PATH"
+      #     eval "$(pyenv init -)"
+      #     pyenv shell 3.9
+      #     python -m twine upload dist/chdb_core_lite-*.whl
+      #   env:
+      #     TWINE_USERNAME: __token__
+      #     TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
+      # # Free-threading wheels live in .github/workflows/build_ft_wheels.yml.
