@@ -1,84 +1,59 @@
-# chDB Version Numbering Rules
+# chDB Version Numbering
 
-## Version Format
+Release tags look like `vX.Y.Z`, with `-rc.N` appended for pre-releases.
 
-chDB follows the [Semantic Versioning (SemVer)](https://semver.org/) specification, with version format: `vX.Y.ZbN`
+`X.Y` tracks the ClickHouse baseline the release is synced to, and `Z` counts chdb-core's own
+releases on that baseline. `v26.5.0` is therefore the first chdb-core release built on the
+ClickHouse 26.5 line — not a claim about any particular ClickHouse patch level.
 
-### Version Components
+| Tag | Date | ClickHouse baseline |
+|---|---|---|
+| `v26.1.0` | 2026-03-02 | 26.1 |
+| `v26.3.0` | 2026-05-11 | 26.3 |
+| `v26.5.0` | 2026-06-06 | 26.5 |
+| `v26.5.1-rc.1` … `-rc.3` | 2026-06-18 … 07-30 | 26.5 |
 
-- **First digit (1)** - **Major Version**
-  - Contains incompatible API changes or major architectural adjustments
-  - Requires compatibility checks when upgrading
-  - Real examples: `v1.0` → `v2.0` → `v3.0`
+Stable releases follow the upstream sync, so the gap between them is however long that sync takes
+— 26 to 70 days for the three above. Pre-releases go out in between as needed.
 
-- **Second digit (2)** - **Minor Version**
-  - New features and backward-compatible API extensions
-  - Generally no breaking changes, safe to upgrade
-  - Real examples: `v3.0.0` → `v3.1.0` → `v3.2.0` → `v3.3.0` → `v3.4.0`
+Major version bumps are reserved for incompatible C API changes. The `v1` / `v2` / `v3` series
+predate the ClickHouse-aligned scheme and do not follow the rule above.
 
-- **Third digit (3)** - **Patch Version**
-  - Backward-compatible bug fixes and minor optimizations
-  - Users can upgrade with confidence, no compatibility concerns
-  - Real examples: `v3.1.0` → `v3.1.1` → `v3.1.2`
+## Pre-releases
 
-- **Suffix b0** - **Beta Version Identifier**
-  - Indicates beta test version, numbering starts from 0
-  - Used for feature testing before official release
-  - Real examples: `v2.2.0b0` → `v2.2.0b1` → `v2.2.0`
+Pre-release tags are `-rc.N`, numbered from 1: `v26.5.1-rc.1`, `v26.5.1-rc.2`, `v26.5.1-rc.3`.
+They carry the same C API as the stable release they lead up to, and are meant for testing a
+baseline sync before it is declared stable.
 
-## Beta Version Overview
+Pre-releases are published as GitHub release artifacts. Only stable versions go to PyPI, so
+`pip install chdb-core` never resolves to an `-rc` build.
 
-### What is a Beta Version
+## Reading the version out of a build
 
-Beta versions are pre-release versions before the official release, used for:
-- Testing new feature stability
-- Collecting user feedback  
-- Discovering potential issues
+Three places carry it, and they answer different questions.
 
-### Beta Version Characteristics
+**`chdb_version()`** — an exported C symbol returning the release tag without the leading `v`,
+for example `26.5.0`. This is what downstream bindings should call: it reports the engine that
+is actually loaded, which is not necessarily the one the caller was built against.
 
-- **pip default installation ignores** beta versions
-- Features are relatively stable but may have unknown issues
-- Suitable for testing environments, use caution in production
+**`CHDB_VERSION`** — the same string as a compile-time constant in `chdb.h`, for C API users who
+need it without opening a connection.
 
-### Installing Beta Versions
+**`SELECT version()`** — the ClickHouse baseline version, four components, for example `26.5.1.1`.
+This is ClickHouse's own number and does not match the chdb-core tag. Do not compare the two.
 
-```bash
-# Install latest beta version
-pip install --pre chdb
+Both `chdb_version()` and `CHDB_VERSION` landed after `v26.5.1-rc.3`, so the first artifact
+carrying them is the next release. Bindings targeting older engines need a fallback.
 
-# Install specific beta version
-pip install chdb==2.2.0b0
-```
+## How the version gets stamped
 
-## Real Version Release Examples
+`chdb/vars.sh` derives the version from the git tag at build time and rewrites the
+`CHDB_VERSION` line in `programs/local/chdb.h` before the header is packaged. The value committed
+to the repository is only a default for source-only builds; a release artifact always carries the
+tag it was built from.
 
-### Latest Version Series (v3.x)
-- **v3.4.0** (July 2025) - Latest stable version, upgraded ClickHouse to v25.5.2.47
-- **v3.3.0** - Added JSON type support and storage metrics
-- **v3.2.0** - Added streaming query API
-- **v3.1.2** - Fix version, resolved multiple bugs
-- **v3.1.1** - Fix version, performance optimizations
-- **v3.1.0** - Added JSON type support
-- **v3.0.1** - Fix version, resolved v3.0.0 issues
-- **v3.0.0** - Major version, introduced connection-based API which is also the default implementation. Users upgrade from v2.x to v3.x should be careful.
-
-### Beta Version Series Examples
-- **v2.2.0b0** - First beta version of v2.2.0
-- **v2.2.0b1** - Second beta version of v2.2.0, fixed issues found in b0
-- **v2.2.0** - Official version release
-
-## Version Upgrade Recommendations
-
-### Safe Upgrades
-- **Patch versions** (e.g., v3.1.0 → v3.1.2): Can upgrade directly
-- **Minor versions** (e.g., v3.1.x → v3.2.x): Usually safe to upgrade, testing recommended
-
-### Cautious Upgrades
-- **Major versions** (e.g., v2.x → v3.x): Need compatibility checks, may require code changes
-- **Beta versions**: Only recommended for testing environments
-
-### Production Environment Recommendations
-- Use stable versions (no beta suffix)
-- Upgrade to latest bugfix version first(eg. v3.1.0 -> v3.1.2)
-- Verify compatibility in testing environment before upgrading
+Release builds verify this with `chdb/check_version_stamp.sh`, which fails the build if the
+stamped value and the release tag disagree. That check matters because the repository also carries
+upstream ClickHouse tags, and the tag lookup in `setup.py` picks the newest tag in the repository
+rather than the newest chdb-core release — it currently rejects those upstream tags only because
+they have four components.
