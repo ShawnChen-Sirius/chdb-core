@@ -23,7 +23,9 @@
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeVariant.h>
 #include <DataTypes/IDataType.h>
+#include <DataTypes/Serializations/ISerialization.h>
 #include <IO/NetUtils.h>
+#include <IO/WriteBufferFromString.h>
 #include <Core/UUID.h>
 #include <Common/assert_cast.h>
 #include <base/arithmeticOverflow.h>
@@ -397,6 +399,10 @@ void RecordBatchEncoder::encodeValues(
             return;
         }
         case TypeIndex::IPv4: appendFixedWidth<ColumnVector<IPv4>>(*this, column, num_rows); return;
+        case TypeIndex::Object:
+        case TypeIndex::Dynamic:
+            encodeAsJSONText(column, type, num_rows, null_map_column);
+            return;
         case TypeIndex::Int128: appendFixedWidth<ColumnVector<Int128>>(*this, column, num_rows); return;
         case TypeIndex::UInt128: appendFixedWidth<ColumnVector<UInt128>>(*this, column, num_rows); return;
         case TypeIndex::Int256: appendFixedWidth<ColumnVector<Int256>>(*this, column, num_rows); return;
@@ -494,6 +500,34 @@ void RecordBatchEncoder::encodeAsBinary(const IColumn & column, size_t num_rows,
     appendBuffer(data.data(), data.size());
 }
 
+void RecordBatchEncoder::encodeAsJSONText(const IColumn & column, const DataTypePtr & type, size_t num_rows, const IColumn * null_map_column)
+{
+    const NullMap * null_map
+        = null_map_column ? &assert_cast<const ColumnUInt8 &>(*null_map_column).getData() : nullptr;
+    PODArray<Int32> arrow_offsets(num_rows + 1);
+    arrow_offsets[0] = 0;
+    PODArray<char> data;
+    size_t total = 0;
+    const auto serialization = type->getDefaultSerialization();
+    const FormatSettings json_settings;
+    for (size_t i = 0; i < num_rows; ++i)
+    {
+        if (!(null_map && (*null_map)[i]))
+        {
+            WriteBufferFromOwnString out;
+            serialization->serializeTextJSON(column, i, out, json_settings);
+            const String value = out.str();
+            total += value.size();
+            if (total > static_cast<size_t>(std::numeric_limits<Int32>::max()))
+                throw Exception(ErrorCodes::TOO_LARGE_ARRAY_SIZE, "Arrow IPC string offset exceeds 32 bits");
+            data.insert(data.end(), value.data(), value.data() + value.size());
+        }
+        arrow_offsets[i + 1] = static_cast<Int32>(total);
+    }
+    appendBuffer(arrow_offsets.data(), (num_rows + 1) * sizeof(Int32));
+    appendBuffer(data.data(), data.size());
+}
+
 void RecordBatchEncoder::encodeField(const IColumn & column, const DataTypePtr & type, size_t num_rows)
 {
     if (isColumnConst(column))
@@ -527,6 +561,12 @@ void RecordBatchEncoder::encodeField(const IColumn & column, const DataTypePtr &
     if (isVariant(type))
     {
         encodeVariant(column, type, num_rows);
+        return;
+    }
+
+    if (isNothing(removeNullable(type)))
+    {
+        nodes.emplace_back(static_cast<Int64>(num_rows), static_cast<Int64>(num_rows));
         return;
     }
 

@@ -31,6 +31,8 @@ const std::string & chdb_streaming_result_error_string(chdb_streaming_result * r
 
 void chdb_destroy_arrow_stream(ArrowArrayStream * arrow_stream);
 
+void chdb_stream_result_set_arrow_uuid_as_fixed(chdb_result * result, bool enabled);
+
 /// Sentinel error texts shared by producers and consumers so fallback
 /// detection can't drift with a reword.
 /// Producer: chdb-arrow-output.cpp (statement yields no result header).
