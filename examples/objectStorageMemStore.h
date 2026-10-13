@@ -36,17 +36,19 @@ struct mem_store
     /* Re-entrancy probe: when set, the next write_begin calls back into chDB on this connection and
      * records whether the engine refused instead of deadlocking. */
     chdb_connection reenter_conn;
+    /* Results of the query, unregister, command-line and legacy query reentry probes. */
     int reenter_query_refused, reenter_unregister_refused;
     int reenter_cmdline_refused, reenter_stable_refused, reenter_stable_v2_refused;
+    /* Active INSERT targeted by the destroy-from-callback probe. */
     chdb_insert_stream reenter_stream;
-    int reenter_destroy_seen;
+    int reenter_destroy_seen; /* the callback attempted to destroy reenter_stream */
     /* Injected faults, read and written under lock. */
     struct
     {
-        int write_append, write_commit, read, list;
+        int write_append, write_commit, read, list; /* force the named callback to fail */
         int read_overcount; /* read reports len + 1 bytes without writing them: a contract violation */
-        int read_unset_count;
-        int list_outside_prefix;
+        int read_unset_count; /* read succeeds without setting *out */
+        int list_outside_prefix; /* list injects host_owned/live into a bad_list/__tmp/ scan */
         const char * read_suffix; /* when set, only reads of keys ending with it fail */
         size_t append_after_bytes; /* when nonzero, write_append fails once bytes_written exceeds it */
         const char * open_keyspace; /* when set, open_keyspace refuses this prefix */

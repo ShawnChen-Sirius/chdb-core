@@ -48,10 +48,10 @@ public:
     bool hasCopy() const { return host->hasCopy(); }
     void copy(const String & from_key, const String & to_key) const;
 
-    /// Reserves the prefix before calling the host. Detach the returned claim once the disk closes.
+    /// Reserves the prefix before openKeyspace; detachDisk releases the claim after closeKeyspace.
     uint64_t attachDisk(const String & key_prefix, bool read_only);
     void detachDisk(uint64_t claim_id) noexcept;
-    /// Includes disks being opened or closed.
+    /// Includes claims held while the host opens or closes a disk.
     bool hasAttachedDisks() const;
 
     /// Overlapping prefixes are allowed only when both disks are read-only.
@@ -87,12 +87,15 @@ private:
     bool fenced = false;
     struct KeyspaceClaim
     {
+        /// Identifies one attachment even when another disk uses the same prefix.
         uint64_t id;
         String prefix;
         bool read_only;
+        /// Keep the claim until closeKeyspace returns.
         bool closing = false;
     };
     std::vector<std::shared_ptr<KeyspaceClaim>> claimed_keyspaces;
+    /// Next claim ID for this registration; a late detach must not release a later attachment.
     uint64_t next_claim_id = 1;
 };
 

@@ -196,7 +196,7 @@ static int cb_read(void * ud, chdb_object_storage_call * call, const char * key,
 
 /* ---- writes ---- */
 
-/* Calls back into chDB from inside a callback, once, and records whether both calls were refused. */
+/* Tries the query and unregister entry points from a callback and records which were refused. */
 static void reenter_probe(void)
 {
     pthread_mutex_lock(&store.lock);
@@ -607,8 +607,7 @@ void mem_store_fill(chdb_object_storage_callbacks * cb, struct mem_registration 
     if (getenv("CHDB_TEST_SERVICE_THREAD"))
         pthread_once(&started, start_service);
 
-    memset(cb, 0, sizeof(*cb));
-    cb->struct_size = sizeof(*cb);
+    *cb = chdb_object_storage_callbacks_init();
     cb->ud = registration;
     cb->metadata = cb_metadata;
     cb->read = cb_read;

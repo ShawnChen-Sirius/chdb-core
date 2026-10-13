@@ -19,13 +19,20 @@ static struct mem_registration fence_registration;
 void registration_api_tests(const chdb_object_storage_callbacks * cb)
 {
     char err[512] = "";
+    chdb_object_storage_callbacks bad = *cb;
+    bad.version = CHDB_OBJECT_STORAGE_ABI_V1 + 1;
+    check(chdb_register_object_storage("mem_wrong_abi", &bad, err, sizeof(err)) == CHDBError
+            && strstr(err, "ABI mismatch"), "unsupported ABI is refused before reading the table");
+    bad.struct_size = CHDB_OBJECT_STORAGE_CALLBACKS_HEADER_SIZE;
+    err[0] = 0;
+    check(chdb_register_object_storage("mem_wrong_abi_short", &bad, err, sizeof(err)) == CHDBError
+            && strstr(err, "ABI mismatch"), "unsupported ABI is refused with only the fixed header present");
     check(chdb_register_object_storage("mem_null", NULL, err, sizeof(err)) == CHDBError && strstr(err, "NULL"),
         "a NULL table is refused with a reason");
     check(chdb_register_object_storage("", cb, NULL, 0) == CHDBError, "an empty name is refused");
 
-    /* struct_size below the engine's sizeof is a header/library mismatch; a larger struct is a newer
-     * caller whose extra fields are ignored (the engine copies only sizeof bytes). */
-    chdb_object_storage_callbacks bad = *cb;
+    /* V1 requires its original callback fields. Unknown fields after that prefix are ignored. */
+    bad = *cb;
     bad.struct_size = sizeof(bad) - 4;
     err[0] = 0;
     check(chdb_register_object_storage("mem_short", &bad, err, sizeof(err)) == CHDBError && strstr(err, "struct_size"),

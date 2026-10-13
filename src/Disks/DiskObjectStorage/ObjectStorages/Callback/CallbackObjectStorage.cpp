@@ -91,6 +91,7 @@ std::unique_ptr<ReadBufferFromFileBase> CallbackObjectStorage::readObject( /// N
     bool use_external_buffer,
     bool /* restrict_seek */) const
 {
+    /// read_hint is not a file length. Use the stored size or query metadata later if it is unknown.
     std::optional<size_t> file_size;
     if (object.bytes_size != StoredObject::UnknownSize)
     {

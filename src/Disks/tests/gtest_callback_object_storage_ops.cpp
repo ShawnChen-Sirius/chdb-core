@@ -21,6 +21,7 @@ namespace
 class TestHost final : public ICallbackObjectStorageHost
 {
 public:
+    /// nullopt simulates a successful read that leaves count unset.
     std::optional<size_t> read_count = 0;
     Status read_status = Status::Ok;
     std::function<Status(const ListSink &)> listing;
