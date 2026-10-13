@@ -131,15 +131,50 @@ void reentrancy_test(chdb_connection conn)
     pthread_mutex_lock(&store.lock);
     store.reenter_conn = conn;
     store.reenter_query_refused = store.reenter_unregister_refused = 0;
+    store.reenter_cmdline_refused = store.reenter_stable_refused = store.reenter_stable_v2_refused = 0;
     pthread_mutex_unlock(&store.lock);
     check(run_ok(conn, "INSERT INTO db.t_reenter SELECT number FROM numbers(10)"), "INSERT whose callback calls back into chDB");
     pthread_mutex_lock(&store.lock);
     int query_refused = store.reenter_query_refused, unregister_refused = store.reenter_unregister_refused;
+    int cmdline_refused = store.reenter_cmdline_refused;
+    int stable_refused = store.reenter_stable_refused;
+    int stable_v2_refused = store.reenter_stable_v2_refused;
     store.reenter_conn = NULL;
     pthread_mutex_unlock(&store.lock);
     check(query_refused, "chdb_query from a callback is refused");
     check(unregister_refused, "chdb_unregister_object_storage from a callback is refused");
+    check(cmdline_refused, "chdb_query_cmdline from a callback is refused");
+    check(stable_refused, "query_stable from a callback returns NULL");
+    check(stable_v2_refused, "query_stable_v2 from a callback returns an error");
     check(run_ok(conn, "DROP TABLE db.t_reenter SYNC"), "DROP the re-entrancy table");
+
+    check(run_ok(conn,
+        "CREATE TABLE db.t_destroy_reenter (k UInt64) ENGINE = MergeTree ORDER BY k"
+        " SETTINGS disk = disk(type = 'callback', storage_name = 'mem_store', key_prefix = 'destroy_reentry')"),
+        "CREATE TABLE for the active stream cleanup probe");
+    chdb_insert_stream stream = chdb_stream_insert(conn, "INSERT INTO db.t_destroy_reenter", "CSV");
+    if (chdb_stream_insert_error(stream))
+    {
+        check(0, "start the cleanup probe INSERT");
+        chdb_destroy_insert_stream(stream);
+        return;
+    }
+    pthread_mutex_lock(&store.lock);
+    store.reenter_stream = stream;
+    store.reenter_destroy_seen = 0;
+    pthread_mutex_unlock(&store.lock);
+    check(chdb_stream_append(stream, "1\n2\n3\n", 6) == CHDBSuccess, "append the cleanup probe rows");
+    chdb_result * done = chdb_stream_done(stream);
+    check(chdb_result_error(done) == NULL, "callback cleanup leaves the active INSERT usable");
+    chdb_destroy_query_result(done);
+    pthread_mutex_lock(&store.lock);
+    int destroy_seen = store.reenter_destroy_seen;
+    store.reenter_stream = NULL;
+    pthread_mutex_unlock(&store.lock);
+    check(destroy_seen, "the callback tried to destroy its active INSERT");
+    chdb_destroy_insert_stream(stream);
+    expect(conn, "cleanup probe committed every row", "SELECT count() FROM db.t_destroy_reenter", "3");
+    check(run_ok(conn, "DROP TABLE db.t_destroy_reenter SYNC"), "DROP the cleanup probe table");
 }
 
 /* Unregistering a store whose disk is open fences it: later operations fail without reaching the host. */

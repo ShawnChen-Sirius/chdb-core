@@ -139,6 +139,8 @@ static local_result_v2 * createErrorLocalResultV2(const String & error)
 
 std::unique_ptr<MaterializedQueryResult> pyEntryClickHouseLocal(int argc, char ** argv)
 {
+    if (DB::CallbackObjectStorageOps::isInsideCallback())
+        return std::make_unique<MaterializedQueryResult>("chDB functions must not be called from an object storage callback");
     try
     {
         std::lock_guard<std::mutex> lock(CHDB_MUTEX);
@@ -1200,6 +1202,11 @@ void chdb_destroy_insert_stream(chdb_insert_stream stream)
     /// which case res->owner dangles and must not be dereferenced.
     if (res->context && res->owner && !insert_stream_finalized(res))
     {
+        if (DB::CallbackObjectStorageOps::isInsideCallback())
+        {
+            LOG_ERROR(&Poco::Logger::get("EmbeddedServer"), "chdb_destroy_insert_stream cannot destroy an active stream from an object storage callback; ignored");
+            return;
+        }
         try
         {
             static_cast<DB::ChdbClient *>(res->owner)->cancelInsertStream(res);

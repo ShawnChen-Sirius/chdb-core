@@ -14,6 +14,36 @@ chdb_result * chdb_query(chdb_connection conn, const char * query, const char * 
     abort();
 }
 
+chdb_result * chdb_query_cmdline(int argc, char ** argv)
+{
+    (void)argc; (void)argv;
+    abort();
+}
+
+struct local_result * query_stable(int argc, char ** argv)
+{
+    (void)argc; (void)argv;
+    abort();
+}
+
+struct local_result_v2 * query_stable_v2(int argc, char ** argv)
+{
+    (void)argc; (void)argv;
+    abort();
+}
+
+void free_result(struct local_result * result)
+{
+    (void)result;
+    abort();
+}
+
+void free_result_v2(struct local_result_v2 * result)
+{
+    (void)result;
+    abort();
+}
+
 const char * chdb_result_error(chdb_result * result)
 {
     (void)result;
@@ -23,6 +53,12 @@ const char * chdb_result_error(chdb_result * result)
 void chdb_destroy_query_result(chdb_result * result)
 {
     (void)result;
+    abort();
+}
+
+void chdb_destroy_insert_stream(chdb_insert_stream stream)
+{
+    (void)stream;
     abort();
 }
 

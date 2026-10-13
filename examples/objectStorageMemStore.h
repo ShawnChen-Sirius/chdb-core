@@ -37,6 +37,9 @@ struct mem_store
      * records whether the engine refused instead of deadlocking. */
     chdb_connection reenter_conn;
     int reenter_query_refused, reenter_unregister_refused;
+    int reenter_cmdline_refused, reenter_stable_refused, reenter_stable_v2_refused;
+    chdb_insert_stream reenter_stream;
+    int reenter_destroy_seen;
     /* Injected faults, read and written under lock. */
     struct
     {
