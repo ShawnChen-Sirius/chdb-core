@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <limits>
 #include <string_view>
 
 namespace DB
@@ -123,11 +124,17 @@ std::optional<CallbackObjectStat> CallbackObjectStorageOps::stat(const String & 
 
 size_t CallbackObjectStorageOps::read(const String & key, uint64_t offset, char * buf, size_t len) const
 {
-    size_t bytes_read = 0;
+    size_t bytes_read = std::numeric_limits<size_t>::max();
     String error;
     const auto status = invoke("read", key, error, [&] { return host->read(key.c_str(), offset, buf, len, bytes_read, error); });
     if (status != Status::Ok)
         throwFailure("read", key, status, error);
+    if (bytes_read == std::numeric_limits<size_t>::max())
+        throw Exception(
+            ErrorCodes::CALLBACK_OBJECT_STORAGE_ERROR,
+            "Callback object storage '{}': read of '{}' did not set the byte count",
+            name,
+            key);
     /// A host that overruns the buffer broke the contract; it is an external failure, not an engine invariant.
     if (bytes_read > len)
         throw Exception(
@@ -196,17 +203,26 @@ void CallbackObjectStorageOps::list(const String & prefix, const ICallbackObject
     /// race on the caller's state, and an exception stops the listing instead of crossing the C ABI.
     std::mutex sink_mutex;
     std::exception_ptr sink_error;
+    bool stopped = false;
     const ICallbackObjectStorageHost::ListSink guarded_sink = [&](const char * key, uint64_t size, int64_t mtime)
     {
         std::lock_guard lock(sink_mutex);
-        if (sink_error)
+        if (stopped || sink_error)
             return true;
         try
         {
             if (!key)
                 throw Exception(
                     ErrorCodes::CALLBACK_OBJECT_STORAGE_ERROR, "Callback object storage '{}': list of '{}' passed a NULL key", name, prefix);
-            return sink(key, size, mtime);
+            if (!std::string_view(key).starts_with(prefix))
+                throw Exception(
+                    ErrorCodes::CALLBACK_OBJECT_STORAGE_ERROR,
+                    "Callback object storage '{}': list of '{}' returned key '{}' outside the requested prefix",
+                    name,
+                    prefix,
+                    key);
+            stopped = sink(key, size, mtime);
+            return stopped;
         }
         catch (...)
         {

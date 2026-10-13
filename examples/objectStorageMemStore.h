@@ -42,6 +42,8 @@ struct mem_store
     {
         int write_append, write_commit, read, list;
         int read_overcount; /* read reports len + 1 bytes without writing them: a contract violation */
+        int read_unset_count;
+        int list_outside_prefix;
         const char * read_suffix; /* when set, only reads of keys ending with it fail */
         size_t append_after_bytes; /* when nonzero, write_append fails once bytes_written exceeds it */
         const char * open_keyspace; /* when set, open_keyspace refuses this prefix */

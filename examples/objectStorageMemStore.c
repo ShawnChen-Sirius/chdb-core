@@ -180,7 +180,8 @@ static int do_read(void * p)
             n = store.max_read;
         if (n) /* a zero-byte blob has no data pointer */
             memcpy(a->buf, b->data + a->offset, n);
-        *a->out = store.fail.read_overcount ? a->len + 1 : n;
+        if (!store.fail.read_unset_count)
+            *a->out = store.fail.read_overcount ? a->len + 1 : n;
         store.bytes_read += n;
     }
     pthread_mutex_unlock(&store.lock);
@@ -393,6 +394,7 @@ static int do_copy(void * p)
     int rc = CHDB_OBJECT_STORAGE_OK;
     pthread_mutex_lock(&store.lock);
     blob * from = find(a->key);
+    int found = from != NULL;
     char * data = from ? malloc(from->size ? from->size : 1) : NULL;
     size_t size = from ? from->size : 0;
     if (data && size)
@@ -400,7 +402,7 @@ static int do_copy(void * p)
     blob * to = data ? find(a->to_key) : NULL; /* add_blob may move the array, so from is not used past here */
     if (data && !to)
         to = add_blob(a->to_key);
-    if (!from)
+    if (!found)
         rc = fail(a->call, CHDB_OBJECT_STORAGE_NOT_FOUND, "copy of missing blob", a->key);
     else if (!to)
         rc = fail(a->call, CHDB_OBJECT_STORAGE_ERROR, "out of memory", a->to_key);
@@ -435,6 +437,8 @@ static int do_list(void * p)
     pthread_mutex_lock(&store.lock);
     if (store.fail.list)
         rc = fail(a->call, CHDB_OBJECT_STORAGE_ERROR, "injected list failure", a->prefix);
+    if (!rc && store.fail.list_outside_prefix && strcmp(a->prefix, "bad_list/__tmp/") == 0)
+        a->sink(a->sink_ud, "host_owned/live", 4, 1);
     for (size_t i = 0; !rc && i < store.count; ++i)
         if (strncmp(store.blobs[i].key, a->prefix, n) == 0
             && a->sink(a->sink_ud, store.blobs[i].key, store.blobs[i].size, store.blobs[i].mtime))

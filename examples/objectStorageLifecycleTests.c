@@ -97,6 +97,24 @@ void keyspace_tests(chdb_connection conn)
     check(strstr(err, "CALLBACK_OBJECT_STORAGE_ERROR") && strstr(err, "keyspace locked by another process"),
         "open_keyspace refuses a disk with the host's reason");
     check(mem_store_count_keys("locked/", NULL) == 0, "the refused disk wrote nothing");
+
+    mem_store_put("host_owned/live", "safe", 4);
+    pthread_mutex_lock(&store.lock);
+    store.fail.list_outside_prefix = 1;
+    pthread_mutex_unlock(&store.lock);
+    check(run_ok(conn,
+        "CREATE TABLE db.t_bad_list (k UInt64) ENGINE = MergeTree ORDER BY k"
+        " SETTINGS disk = disk(type = 'callback', storage_name = 'mem_store', key_prefix = 'bad_list')"),
+        "CREATE TABLE survives a refused scratch sweep");
+    pthread_mutex_lock(&store.lock);
+    store.fail.list_outside_prefix = 0;
+    pthread_mutex_unlock(&store.lock);
+    check(mem_store_has("host_owned/live"), "scratch sweep cannot delete a key outside its prefix");
+    check(run_ok(conn, "DROP TABLE db.t_bad_list SYNC"), "DROP the scratch sweep test table");
+    chdb_object_storage_callbacks cleanup;
+    mem_store_fill(&cleanup, NULL);
+    chdb_object_storage_call call = {sizeof(call), NULL, 0};
+    check(cleanup.remove(cleanup.ud, &call, "host_owned/live") == CHDB_OBJECT_STORAGE_OK, "remove the protected host test key");
 }
 
 /* A callback that calls back into chDB on the connection running the statement is refused instead of
