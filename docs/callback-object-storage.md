@@ -67,9 +67,7 @@ The program does four things.
 **1. Register the store** before any `chdb_connect` that may reopen tables on it:
 
 ```c
-chdb_object_storage_callbacks cb;
-memset(&cb, 0, sizeof(cb));
-cb.struct_size = sizeof(cb);          /* lets newer engines accept older hosts */
+chdb_object_storage_callbacks cb = chdb_object_storage_callbacks_init();
 cb.metadata = on_metadata;
 cb.read = on_read;
 cb.write_begin = on_write_begin;
@@ -131,6 +129,28 @@ static int on_read(void * ud, chdb_object_storage_call * call, const char * key,
 }
 ```
 
+## ABI v1
+
+Include the installed `chdb.h` and assign functions without pointer casts. Start with
+`chdb_object_storage_callbacks_init()`. It sets `struct_size` to the table size and `version` to
+`CHDB_OBJECT_STORAGE_ABI_V1`. The number identifies the callback contract, independent of the chDB release.
+
+- The library checks that `struct_size` covers the fixed header before reading `version`. An older
+  library rejects a future version before reading its callbacks.
+- Keep the v1 fields, signatures and required behavior unchanged. Optional callbacks may be appended
+  without changing `CHDB_OBJECT_STORAGE_ABI_V1`.
+- For v1, the library accepts the fixed `CHDB_OBJECT_STORAGE_CALLBACKS_V1_SIZE` prefix, zeros missing
+  optional fields and ignores unknown tail fields. It reads a field only when the whole field fits.
+- `call->struct_size` describes the engine's call context. Hosts check it before using future fields.
+- An incompatible callback contract needs a new version and a type for its new signatures. Both
+  types start with `struct_size` and `version`. A host selects the new version explicitly. The
+  `chdb_register_object_storage` symbol stays the same; its `const void *` parameter accepts the
+  table, and the library selects the layout after checking the header.
+- Dynamic bindings resolve `chdb_register_object_storage` and `chdb_unregister_object_storage`.
+  They set both `struct_size` and `version` in their callback table before registration.
+
+These rules cover callbacks, not on-disk upgrade or rollback compatibility.
+
 ## The callback table
 
 | Callback | Required | What it does |
@@ -149,10 +169,10 @@ static int on_read(void * ud, chdb_object_storage_call * call, const char * key,
 
 Details that hosts commonly get wrong:
 
-- **Write handles are not bounded.** `write_begin` runs when the engine opens a file, before any
+- **Do not wait for write handles.** `write_begin` runs when the engine opens a file, before any
   data, and a part writer keeps two handles per column substream plus the index streams open until the
-  part is finished. Concurrent inserts and merges add more. Never cap pending handles or block in
-  `write_begin` waiting for one.
+  part is finished. Concurrent inserts and merges add more. Resource limits may return an error;
+  never wait for a handle whose release depends on this statement finishing.
 - **A commit may follow `write_begin` with no append.** Store a zero-length blob.
 - **`write_commit` releases the handle on failure too.** Discard the pending blob yourself; the
   engine does not call `write_abort` after a commit.
@@ -192,9 +212,16 @@ Callbacks must return normally: never `longjmp` out of one (for example through 
 engine reports it as the same error.
 
 `chdb_register_object_storage` and `chdb_unregister_object_storage` take an optional error buffer
-too. A refusal names its reason: a missing callback by field name, a `struct_size` that does not
-match the header, `open_keyspace` without `close_keyspace`, a name that is already registered, or a
+too. A refusal names its reason: a missing callback by field name, a `struct_size` too short for
+v1, `open_keyspace` without `close_keyspace`, a name that is already registered, or a
 name whose previous registration still has open disks.
+
+## Engine checks and host responsibilities
+
+The engine checks the ABI and table size, required callbacks, paired keyspace hooks, read byte counts,
+list prefixes and stop requests. It also rejects same-thread engine reentry and conflicting disk claims.
+The host must supply correct content and timestamps, durable storage and locks across processes.
+The engine cannot sandbox C code. A host must not retain a `call` pointer after its callback returns.
 
 ## Lifecycle: register, connect, unregister
 
@@ -224,6 +251,9 @@ chdb_unregister_object_storage("store", ...)
   closed, which happens when the last connection closes. Until then it is refused: a
   `disk(...)` with the same arguments would keep using the old, fenced disk.
 
+After unregister returns, free any pending writes and external locks belonging to that registration.
+The engine will not call its abort or close hooks again. Close connections first when possible.
+
 ## Threads
 
 Callbacks run:
@@ -235,10 +265,10 @@ Callbacks run:
 
 Calls may be concurrent, including on the same key, but never on one write handle. Two rules follow:
 
-- **Never call `chdb_*` from a callback.** The engine detects this on the thread it called the
-  callback on and refuses the call (an error result, a NULL connection or `CHDBError`) instead of
-  deadlocking on the connection mutex. A call made by some other thread that the callback waits on
-  cannot be detected and deadlocks.
+- **Do not reenter the engine from a callback.** Query/stream operations, connection changes,
+  shutdown and registration changes are refused on the callback's thread. Destroying an active
+  INSERT stream is ignored; destroy it after the callback returns. Materialized result cleanup and
+  version/result accessors are allowed. Reentry from a thread the callback waits on is not detected.
 - **Never make a callback wait for the thread that is inside `chdb_*`.** That thread is blocked
   until the statement finishes.
 
@@ -305,9 +335,9 @@ SETTINGS disk = disk(type = 'callback', storage_name = 'store', key_prefix = 'te
 - Choose the prefix once per keyspace and never change it for existing data.
 - Without a prefix, the disk's keys live at the store root next to `__meta/` and `__root/`; keep
   host-owned blobs out of that namespace.
-- A disk claims its whole prefix. A second read-write disk on the same store whose prefix overlaps an
-  open one (equal, empty, or one a prefix of the other; a trailing `/` is ignored, so `'a'` and
-  `'a/'` are the same keyspace) is refused when it is created, before it reads or deletes any key.
+- Independent disks may share overlapping prefixes only when both are read-only. Overlap means equal
+  prefixes, an empty prefix, or one a prefix of the other; trailing `/` is ignored. A conflict fails
+  before the new disk reads or deletes any key.
 - Tables that use exactly the same `disk(...)` arguments share one disk, which is fine.
 
 ## Several processes: open_keyspace and close_keyspace
@@ -364,9 +394,9 @@ SETTINGS disk = disk(type = 'callback', storage_name = 'store', read_only = 1);
 
 The disk loads the directory tree from the store when it opens, `open_keyspace` receives
 `CHDB_OBJECT_STORAGE_READ_ONLY`, reads work, and writes fail with `TABLE_IS_PERMANENTLY_READ_ONLY`.
-Read-only disks do not claim their keyspace, so inside one process several of them can share a
-prefix with each other and with one writer; across processes, your `open_keyspace` decides. They
-never write to the store, so they also skip the scratch sweep described in
+Read-only disks claim their keyspace and may share it with other readers, but not an independent
+writer. Across processes the host must enforce the same rule. Normal reads and writes through one
+read-write disk are unchanged. Read-only disks skip the scratch sweep described in
 [Crash recovery](#crash-recovery).
 
 ## What MergeTree can do on this disk
@@ -420,6 +450,11 @@ the host side with UBSan. The driver
 ([`examples/chdbObjectStorageTest.c`](../examples/chdbObjectStorageTest.c)) and its companions show how
 to check a host's own behaviour:
 
+`bash examples/runObjectStorageHostTest.sh` runs the reference-store and frozen-v1 fixture tests
+without a libchdb build. Set `CHDB_TEST_SANITIZE=address,undefined` to enable sanitizers.
+The fixture covers header/table handling, not the full library registry or query engine. Those are
+exercised by the integration runner and the `ENABLE_TESTS=1` callback gtests.
+
 - [`objectStorageFaultTests.c`](../examples/objectStorageFaultTests.c) injects a failure into each
   callback and checks that the statement fails with `CALLBACK_OBJECT_STORAGE_ERROR`, that no write
   handle leaks, and that reads capped at 1000 bytes give the same results.
@@ -433,13 +468,14 @@ Before shipping a host, check it against this list:
 
 - [ ] Returns `NOT_FOUND`, not `ERROR`, for a missing key in `metadata`, and success for a missing key
       in `remove`.
-- [ ] Never writes more than `len` bytes in `read`, and never sets `*out > len`.
+- [ ] Sets `*out` on every successful read, never above `len`, and never writes past the buffer.
+- [ ] Lists only the requested prefix and stops delivering when the sink asks it to stop.
 - [ ] Stores a zero-length blob when `write_commit` follows `write_begin` with no append.
 - [ ] Releases the handle in `write_commit` even when the commit fails.
-- [ ] Does not bound the number of pending write handles.
+- [ ] Returns an error at resource limits rather than waiting for a handle the statement must release.
 - [ ] Reports the real commit time as `mtime`.
 - [ ] Makes a commit durable (or durable in order) before returning.
-- [ ] Never calls `chdb_*` from a callback, and never waits for the thread inside `chdb_*`.
+- [ ] Never reenters the engine from a callback or waits for the thread inside `chdb_*`.
 - [ ] Writes failure messages into `call->error`, not into thread-local state.
 - [ ] Registers before `chdb_connect`, and unregisters from its exit hook before freeing the store.
 - [ ] Gives every disk its own `key_prefix`, and locks keyspaces across processes in `open_keyspace`

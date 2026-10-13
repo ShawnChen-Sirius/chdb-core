@@ -1197,11 +1197,10 @@ CHDB_EXPORT chdb_state chdb_shutdown(void);
  * per store and never change it for an existing store. With no prefix all
  * keys of the disk live at the store root next to __meta/ and __root/, so
  * keep host-owned blobs out of that namespace. A disk claims its whole
- * prefix: creating a second read-write disk on the same store whose prefix
- * overlaps one that is open (equal, one empty, or one a prefix of the other,
- * trailing '/' ignored) fails before the second disk reads or deletes any
- * key, so a host that wants several disks over one store gives every disk its
- * own prefix from the start.
+ * prefix. Independent disks may share overlapping prefixes only when both
+ * are read-only. Overlap means equal prefixes, an empty prefix, or one a
+ * prefix of the other (trailing '/' ignored). Conflicts fail before the new
+ * disk reads or deletes any key. Tables may reuse the same read-write disk.
  *
  * Status codes: every callback returns a chdb_object_storage_status, 0 on
  * success. CHDB_OBJECT_STORAGE_NOT_FOUND says a key does not exist: metadata
@@ -1227,12 +1226,14 @@ CHDB_EXPORT chdb_state chdb_shutdown(void);
  * while that caller is blocked inside chdb_*, and (c) on background
  * merge/mutation threads with no chdb_* call in flight, for as long as the
  * connection is open. Calls may be concurrent, including on the same key, but
- * never on one write handle. A callback must not call any chdb_* function and
- * must never block waiting for the thread that is inside a chdb_* call: a host
+ * never on one write handle. A callback must not start, advance or cancel
+ * queries, open/close connections, stop the engine or change registrations.
+ * Version/result accessors and freeing materialized results are allowed.
+ * Never block waiting for the thread that is inside a chdb_* call: a host
  * whose store may only be touched from one thread must make that a dedicated
  * service thread that never calls chdb_*, or guard the store with a lock.
- * Running callbacks on the thread that calls chdb_query is not supported by
- * this API. A chdb_* call made by a callback on the thread the engine called
+ * Callbacks may run on engine threads as well as the caller's thread.
+ * An engine-entry call made by a callback on the thread the engine called
  * it on is refused rather than deadlocking (connection calls return an error
  * result, chdb_connect returns NULL, chdb_close_conn does nothing, the
  * registration functions and chdb_shutdown return CHDBError); one made by
@@ -1317,6 +1318,9 @@ typedef enum chdb_object_storage_status
     CHDB_OBJECT_STORAGE_NOT_FOUND = 2,
 } chdb_object_storage_status;
 
+/* The initial callback contract. Optional tail fields do not change its version. */
+#define CHDB_OBJECT_STORAGE_ABI_V1 1u
+
 /* open_keyspace flag: the disk was created with read_only = 1 and never writes. */
 #define CHDB_OBJECT_STORAGE_READ_ONLY 1u
 
@@ -1330,6 +1334,9 @@ typedef struct chdb_object_storage_call
     size_t error_size;
 } chdb_object_storage_call;
 
+#define CHDB_OBJECT_STORAGE_CALL_V1_SIZE \
+    (offsetof(chdb_object_storage_call, error_size) + sizeof(size_t))
+
 // Called by `list` for each matching blob, only before `list` returns (from
 // any thread). mtime is the host's wall-clock time, Unix seconds, at which
 // write_commit published the blob. Returns nonzero to ask the host to stop
@@ -1338,11 +1345,10 @@ typedef int (*chdb_object_storage_list_sink)(void * sink_ud, const char * key, u
 
 typedef struct chdb_object_storage_callbacks
 {
-    // Caller sets to sizeof(chdb_object_storage_callbacks). An engine accepts a
-    // struct at least as large as its own and ignores fields it does not know
-    // (gate optional additions on chdb_version()); a smaller struct is a
-    // header/library mismatch and is refused.
+    // Set to sizeof the caller's table. The library ignores unknown tail fields.
     uint32_t struct_size;
+    // Set by chdb_object_storage_callbacks_init() to V1. Unknown versions are rejected before reading callbacks.
+    uint32_t version;
     // Opaque pointer handed back as the first argument of every callback.
     void * ud;
 
@@ -1361,14 +1367,10 @@ typedef struct chdb_object_storage_callbacks
     // past buf have corrupted engine memory.
     int (*read)(void * ud, chdb_object_storage_call * call, const char * key, uint64_t offset, void * buf, size_t len, size_t * out);
 
-    // Starts writing a blob, replacing any existing one on commit. *handle is
-    // opaque to the engine (NULL is a valid handle) and identifies this write
-    // until commit or abort. Called when the engine opens a file, before any
-    // data: a MergeTree part writer opens two handles per column substream
-    // plus index streams up front and holds them until the part is finished,
-    // and concurrent inserts and merges add their own, so hosts must not bound
-    // pending handles or block here waiting for one. write_commit may follow
-    // write_begin with no write_append; store a zero-length blob.
+    // Starts a replacement blob with an opaque handle (NULL is valid).
+    // Part writers may hold many handles until all streams finish.
+    // Fail at resource limits; do not wait for this statement to release one.
+    // Commit may follow without append; publish a zero-length blob.
     int (*write_begin)(void * ud, chdb_object_storage_call * call, const char * key, void ** handle);
     // Appends len bytes in order.
     int (*write_append)(void * ud, chdb_object_storage_call * call, void * handle, const void * buf, size_t len);
@@ -1403,9 +1405,30 @@ typedef struct chdb_object_storage_callbacks
     void (*close_keyspace)(void * ud, const char * key_prefix);
 } chdb_object_storage_callbacks;
 
+/* The fixed prefix must be present before the library reads version. */
+#define CHDB_OBJECT_STORAGE_CALLBACKS_HEADER_SIZE \
+    (offsetof(chdb_object_storage_callbacks, version) + sizeof(uint32_t))
+
+/* Keep the v1 boundary fixed when appending optional callbacks. */
+#define CHDB_OBJECT_STORAGE_CALLBACKS_V1_SIZE \
+    (offsetof(chdb_object_storage_callbacks, close_keyspace) + sizeof(void (*)(void *, const char *)))
+
+static inline chdb_object_storage_callbacks chdb_object_storage_callbacks_init(void)
+{
+#ifdef __cplusplus
+    chdb_object_storage_callbacks cb{};
+#else
+    chdb_object_storage_callbacks cb = {0};
+#endif
+    cb.struct_size = sizeof(cb);
+    cb.version = CHDB_OBJECT_STORAGE_ABI_V1;
+    return cb;
+}
+
 /**
  * Registers a callback object storage under `name`, for `storage_name = '<name>'`
- * in a callback disk. The table is copied.
+ * in a callback disk. The library reads struct_size and version first, then
+ * copies the callbacks for that version.
  *
  * Must be registered before the chdb_connect() that opens a --path whose
  * metadata already contains tables on this storage_name: metadata load
@@ -1418,14 +1441,15 @@ typedef struct chdb_object_storage_callbacks
  *                    when the call fails, truncated to error_size bytes.
  * @param error_size  Size of the error buffer.
  * @return CHDBError if name is empty or already registered, disks of a
- *         previous registration of name are still open, struct_size is smaller
- *         than sizeof(chdb_object_storage_callbacks), a required callback is
- *         NULL (all but copy, open_keyspace and close_keyspace), only one of
- *         open_keyspace and close_keyspace is set, or it is called from a
- *         callback.
+ *         previous registration of name are still open, cb is NULL, or version
+ *         is unsupported. struct_size must cover the fixed header. For v1 it
+ *         also rejects a struct_size smaller than
+ *         CHDB_OBJECT_STORAGE_CALLBACKS_V1_SIZE or a missing required callback
+ *         (all but copy, open_keyspace and close_keyspace). Registration also
+ *         fails when only one keyspace hook is set or when called from a callback.
  */
 CHDB_EXPORT chdb_state chdb_register_object_storage(
-    const char * name, const chdb_object_storage_callbacks * cb, char * error, size_t error_size);
+    const char * name, const void * cb, char * error, size_t error_size);
 
 /**
  * Removes a registration and fences it: waits for its running callbacks to

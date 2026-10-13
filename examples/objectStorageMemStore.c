@@ -180,7 +180,8 @@ static int do_read(void * p)
             n = store.max_read;
         if (n) /* a zero-byte blob has no data pointer */
             memcpy(a->buf, b->data + a->offset, n);
-        *a->out = store.fail.read_overcount ? a->len + 1 : n;
+        if (!store.fail.read_unset_count)
+            *a->out = store.fail.read_overcount ? a->len + 1 : n;
         store.bytes_read += n;
     }
     pthread_mutex_unlock(&store.lock);
@@ -195,7 +196,7 @@ static int cb_read(void * ud, chdb_object_storage_call * call, const char * key,
 
 /* ---- writes ---- */
 
-/* Calls back into chDB from inside a callback, once, and records whether both calls were refused. */
+/* Tries the query and unregister entry points from a callback and records which were refused. */
 static void reenter_probe(void)
 {
     pthread_mutex_lock(&store.lock);
@@ -214,9 +215,27 @@ static void reenter_probe(void)
     int unregister_refused = chdb_unregister_object_storage("mem_store", err, sizeof(err)) == CHDBError
         && strstr(err, "object storage callback") != NULL;
 
+    char arg0[] = "chdb";
+    char arg1[] = "--query=SELECT 1";
+    char * argv[] = {arg0, arg1};
+    r = chdb_query_cmdline(2, argv);
+    e = chdb_result_error(r);
+    int cmdline_refused = e && strstr(e, "object storage callback") != NULL;
+    chdb_destroy_query_result(r);
+    struct local_result * legacy = query_stable(2, argv);
+    int stable_refused = legacy == NULL;
+    free_result(legacy);
+    struct local_result_v2 * legacy_v2 = query_stable_v2(2, argv);
+    int stable_v2_refused = legacy_v2 && legacy_v2->error_message
+        && strstr(legacy_v2->error_message, "object storage callback") != NULL;
+    free_result_v2(legacy_v2);
+
     pthread_mutex_lock(&store.lock);
     store.reenter_query_refused = query_refused;
     store.reenter_unregister_refused = unregister_refused;
+    store.reenter_cmdline_refused = cmdline_refused;
+    store.reenter_stable_refused = stable_refused;
+    store.reenter_stable_v2_refused = stable_v2_refused;
     pthread_mutex_unlock(&store.lock);
 }
 
@@ -264,11 +283,28 @@ static void drop_write(pending_write * w)
 
 typedef struct { void * ud; chdb_object_storage_call * call; void * handle; const void * buf; size_t len; } append_args;
 
+static void destroy_reentry_probe(const char * key)
+{
+    if (strncmp(key, "destroy_reentry/", strlen("destroy_reentry/")) != 0)
+        return;
+    pthread_mutex_lock(&store.lock);
+    chdb_insert_stream stream = store.reenter_stream;
+    store.reenter_stream = NULL;
+    pthread_mutex_unlock(&store.lock);
+    if (!stream)
+        return;
+    chdb_destroy_insert_stream(stream);
+    pthread_mutex_lock(&store.lock);
+    store.reenter_destroy_seen = 1;
+    pthread_mutex_unlock(&store.lock);
+}
+
 static int do_write_append(void * p)
 {
     append_args * a = p;
     count_call(a->ud);
     pending_write * w = a->handle;
+    destroy_reentry_probe(w->key);
     int rc = CHDB_OBJECT_STORAGE_OK;
     pthread_mutex_lock(&store.lock);
     store.bytes_written += a->len;
@@ -393,6 +429,7 @@ static int do_copy(void * p)
     int rc = CHDB_OBJECT_STORAGE_OK;
     pthread_mutex_lock(&store.lock);
     blob * from = find(a->key);
+    int found = from != NULL;
     char * data = from ? malloc(from->size ? from->size : 1) : NULL;
     size_t size = from ? from->size : 0;
     if (data && size)
@@ -400,7 +437,7 @@ static int do_copy(void * p)
     blob * to = data ? find(a->to_key) : NULL; /* add_blob may move the array, so from is not used past here */
     if (data && !to)
         to = add_blob(a->to_key);
-    if (!from)
+    if (!found)
         rc = fail(a->call, CHDB_OBJECT_STORAGE_NOT_FOUND, "copy of missing blob", a->key);
     else if (!to)
         rc = fail(a->call, CHDB_OBJECT_STORAGE_ERROR, "out of memory", a->to_key);
@@ -435,6 +472,8 @@ static int do_list(void * p)
     pthread_mutex_lock(&store.lock);
     if (store.fail.list)
         rc = fail(a->call, CHDB_OBJECT_STORAGE_ERROR, "injected list failure", a->prefix);
+    if (!rc && store.fail.list_outside_prefix && strcmp(a->prefix, "bad_list/__tmp/") == 0)
+        a->sink(a->sink_ud, "host_owned/live", 4, 1);
     for (size_t i = 0; !rc && i < store.count; ++i)
         if (strncmp(store.blobs[i].key, a->prefix, n) == 0
             && a->sink(a->sink_ud, store.blobs[i].key, store.blobs[i].size, store.blobs[i].mtime))
@@ -568,8 +607,7 @@ void mem_store_fill(chdb_object_storage_callbacks * cb, struct mem_registration 
     if (getenv("CHDB_TEST_SERVICE_THREAD"))
         pthread_once(&started, start_service);
 
-    memset(cb, 0, sizeof(*cb));
-    cb->struct_size = sizeof(*cb);
+    *cb = chdb_object_storage_callbacks_init();
     cb->ud = registration;
     cb->metadata = cb_metadata;
     cb->read = cb_read;

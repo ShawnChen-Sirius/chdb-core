@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <limits>
 #include <string_view>
 
 namespace DB
@@ -123,11 +124,17 @@ std::optional<CallbackObjectStat> CallbackObjectStorageOps::stat(const String & 
 
 size_t CallbackObjectStorageOps::read(const String & key, uint64_t offset, char * buf, size_t len) const
 {
-    size_t bytes_read = 0;
+    size_t bytes_read = std::numeric_limits<size_t>::max();
     String error;
     const auto status = invoke("read", key, error, [&] { return host->read(key.c_str(), offset, buf, len, bytes_read, error); });
     if (status != Status::Ok)
         throwFailure("read", key, status, error);
+    if (bytes_read == std::numeric_limits<size_t>::max())
+        throw Exception(
+            ErrorCodes::CALLBACK_OBJECT_STORAGE_ERROR,
+            "Callback object storage '{}': read of '{}' did not set the byte count",
+            name,
+            key);
     /// A host that overruns the buffer broke the contract; it is an external failure, not an engine invariant.
     if (bytes_read > len)
         throw Exception(
@@ -196,17 +203,26 @@ void CallbackObjectStorageOps::list(const String & prefix, const ICallbackObject
     /// race on the caller's state, and an exception stops the listing instead of crossing the C ABI.
     std::mutex sink_mutex;
     std::exception_ptr sink_error;
+    bool stopped = false;
     const ICallbackObjectStorageHost::ListSink guarded_sink = [&](const char * key, uint64_t size, int64_t mtime)
     {
         std::lock_guard lock(sink_mutex);
-        if (sink_error)
+        if (stopped || sink_error)
             return true;
         try
         {
             if (!key)
                 throw Exception(
                     ErrorCodes::CALLBACK_OBJECT_STORAGE_ERROR, "Callback object storage '{}': list of '{}' passed a NULL key", name, prefix);
-            return sink(key, size, mtime);
+            if (!std::string_view(key).starts_with(prefix))
+                throw Exception(
+                    ErrorCodes::CALLBACK_OBJECT_STORAGE_ERROR,
+                    "Callback object storage '{}': list of '{}' returned key '{}' outside the requested prefix",
+                    name,
+                    prefix,
+                    key);
+            stopped = sink(key, size, mtime);
+            return stopped;
         }
         catch (...)
         {
@@ -232,64 +248,76 @@ void CallbackObjectStorageOps::copy(const String & from_key, const String & to_k
         throwFailure("copy", from_key, status, error);
 }
 
-void CallbackObjectStorageOps::attachDisk(const String & key_prefix, bool read_only)
+uint64_t CallbackObjectStorageOps::attachDisk(const String & key_prefix, bool read_only)
 {
-    /// Read-only disks load a snapshot and never write, so they may share a keyspace, as upstream allows
-    /// for read-only plain disks.
-    if (!read_only)
-        claimKeyspace(key_prefix);
+    const auto claim_id = claimKeyspace(key_prefix, read_only);
     try
     {
         openKeyspace(key_prefix, read_only);
+        std::lock_guard lock(mutex);
+        if (fenced)
+            throw Exception(ErrorCodes::CALLBACK_OBJECT_STORAGE_ERROR, "Callback object storage '{}' was unregistered while opening a disk", name);
     }
     catch (...)
     {
-        if (!read_only)
-            releaseKeyspace(key_prefix);
+        releaseKeyspace(claim_id);
         throw;
     }
-    std::lock_guard lock(mutex);
-    ++attached_disks;
+    return claim_id;
 }
 
-void CallbackObjectStorageOps::detachDisk(const String & key_prefix, bool read_only) noexcept
+void CallbackObjectStorageOps::detachDisk(uint64_t claim_id) noexcept
 {
-    closeKeyspace(key_prefix);
-    if (!read_only)
-        releaseKeyspace(key_prefix);
-    std::lock_guard lock(mutex);
-    --attached_disks;
+    std::shared_ptr<KeyspaceClaim> claim;
+    {
+        std::lock_guard lock(mutex);
+        auto it = std::find_if(claimed_keyspaces.begin(), claimed_keyspaces.end(),
+            [claim_id](const auto & current) { return current->id == claim_id; });
+        if (it == claimed_keyspaces.end() || (*it)->closing)
+            return;
+        claim = *it;
+        claim->closing = true;
+    }
+    closeKeyspace(claim->prefix);
+    releaseKeyspace(claim_id);
 }
 
 bool CallbackObjectStorageOps::hasAttachedDisks() const
 {
     std::lock_guard lock(mutex);
-    return attached_disks != 0;
+    return !claimed_keyspaces.empty();
 }
 
-void CallbackObjectStorageOps::claimKeyspace(const String & key_prefix)
+uint64_t CallbackObjectStorageOps::claimKeyspace(const String & key_prefix, bool read_only)
 {
     const auto keyspace = normalizeKeyspace(key_prefix);
     std::lock_guard lock(mutex);
+    if (fenced)
+        throw Exception(ErrorCodes::CALLBACK_OBJECT_STORAGE_ERROR, "Callback object storage '{}' was unregistered", name);
     for (const auto & claimed : claimed_keyspaces)
     {
-        if (keyspace.starts_with(claimed) || std::string_view(claimed).starts_with(keyspace))
+        const auto existing = normalizeKeyspace(claimed->prefix);
+        if ((!read_only || !claimed->read_only) && (keyspace.starts_with(existing) || existing.starts_with(keyspace)))
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
-                "Callback object storage '{}': key_prefix '{}' overlaps key_prefix '{}' of a disk already open on this store. "
-                "Give every disk on one store its own prefix, none a prefix of another (an empty prefix overlaps every other)",
+                "Callback object storage '{}': {} disk with key_prefix '{}' overlaps {} disk with key_prefix '{}'. "
+                "Only read-only disks may share overlapping prefixes; reuse the existing disk or choose a separate prefix",
                 name,
+                read_only ? "read-only" : "read-write",
                 key_prefix,
-                claimed);
+                claimed->read_only ? "read-only" : "read-write",
+                claimed->prefix);
     }
-    claimed_keyspaces.emplace_back(keyspace);
+    const auto claim_id = next_claim_id++;
+    claimed_keyspaces.push_back(std::make_shared<KeyspaceClaim>(KeyspaceClaim{claim_id, key_prefix, read_only}));
+    return claim_id;
 }
 
-void CallbackObjectStorageOps::releaseKeyspace(const String & key_prefix) noexcept
+void CallbackObjectStorageOps::releaseKeyspace(uint64_t claim_id) noexcept
 {
-    const auto keyspace = normalizeKeyspace(key_prefix);
     std::lock_guard lock(mutex);
-    auto it = std::find(claimed_keyspaces.begin(), claimed_keyspaces.end(), keyspace);
+    auto it = std::find_if(claimed_keyspaces.begin(), claimed_keyspaces.end(),
+        [claim_id](const auto & claim) { return claim->id == claim_id; });
     if (it != claimed_keyspaces.end())
         claimed_keyspaces.erase(it);
 }

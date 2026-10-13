@@ -1,5 +1,6 @@
 #include "chdb.h"
 #include "chdb-internal.h"
+#include "ObjectStorageCallbackTable.h"
 #include "ChunkCollectorOutputFormat.h"
 #include "LocalServer.h"
 
@@ -139,6 +140,8 @@ static local_result_v2 * createErrorLocalResultV2(const String & error)
 
 std::unique_ptr<MaterializedQueryResult> pyEntryClickHouseLocal(int argc, char ** argv)
 {
+    if (DB::CallbackObjectStorageOps::isInsideCallback())
+        return std::make_unique<MaterializedQueryResult>("chDB queries cannot run from an object storage callback");
     try
     {
         std::lock_guard<std::mutex> lock(CHDB_MUTEX);
@@ -1200,6 +1203,11 @@ void chdb_destroy_insert_stream(chdb_insert_stream stream)
     /// which case res->owner dangles and must not be dereferenced.
     if (res->context && res->owner && !insert_stream_finalized(res))
     {
+        if (DB::CallbackObjectStorageOps::isInsideCallback())
+        {
+            LOG_ERROR(&Poco::Logger::get("EmbeddedServer"), "chdb_destroy_insert_stream called from an object storage callback with an active stream; the stream remains open");
+            return;
+        }
         try
         {
             static_cast<DB::ChdbClient *>(res->owner)->cancelInsertStream(res);
@@ -1768,7 +1776,8 @@ private:
 
 }
 
-chdb_state chdb_register_object_storage(const char * name, const chdb_object_storage_callbacks * cb, char * error, size_t error_size)
+chdb_state chdb_register_object_storage(
+    const char * name, const void * cb, char * error, size_t error_size)
 {
     auto fail = [&](std::string_view message)
     {
@@ -1777,43 +1786,15 @@ chdb_state chdb_register_object_storage(const char * name, const chdb_object_sto
     };
 
     if (DB::CallbackObjectStorageOps::isInsideCallback())
-        return fail("chdb_register_object_storage must not be called from an object storage callback");
+        return fail("object storage registration cannot run from a callback");
     if (!name || !*name)
         return fail("name must be a non-empty string");
-    if (!cb)
-        return fail("the callback table is NULL");
-    if (cb->struct_size < sizeof(chdb_object_storage_callbacks))
-        return fail(fmt::format(
-            "struct_size {} is smaller than sizeof(chdb_object_storage_callbacks) = {}: chdb.h does not match this libchdb",
-            cb->struct_size,
-            sizeof(chdb_object_storage_callbacks)));
-
-    /// A newer caller's extra fields are ignored. When a field is appended later, accept the exact
-    /// earlier sizeof values or anything >= the current sizeof, never a size in between.
-    chdb_object_storage_callbacks table{};
-    memcpy(&table, cb, sizeof(table));
-
-    std::string missing;
-    auto require = [&](bool present, std::string_view field)
-    {
-        if (!present)
-            missing += fmt::format("{}{}", missing.empty() ? "" : ", ", field);
-    };
-    require(table.metadata != nullptr, "metadata");
-    require(table.read != nullptr, "read");
-    require(table.write_begin != nullptr, "write_begin");
-    require(table.write_append != nullptr, "write_append");
-    require(table.write_commit != nullptr, "write_commit");
-    require(table.write_abort != nullptr, "write_abort");
-    require(table.remove != nullptr, "remove");
-    require(table.list != nullptr, "list");
-    if (!missing.empty())
-        return fail("required callbacks are NULL: " + missing);
-    if ((table.open_keyspace == nullptr) != (table.close_keyspace == nullptr))
-        return fail("open_keyspace and close_keyspace must be set together");
-
     try
     {
+        chdb_object_storage_callbacks table;
+        std::string table_error;
+        if (!ObjectStorageApi::copyTable(cb, table, table_error))
+            return fail(table_error);
         auto ops = std::make_shared<DB::CallbackObjectStorageOps>(name, std::make_unique<CApiObjectStorageHost>(table));
         DB::CallbackObjectStorageRegistry::instance().add(name, std::move(ops));
         return CHDBSuccess;
@@ -1829,7 +1810,7 @@ chdb_state chdb_unregister_object_storage(const char * name, char * error, size_
     if (DB::CallbackObjectStorageOps::isInsideCallback())
     {
         /// Fencing waits for the callbacks in flight, this one included.
-        setObjectStorageApiError(error, error_size, "chdb_unregister_object_storage must not be called from an object storage callback");
+        setObjectStorageApiError(error, error_size, "object storage unregistration cannot run from a callback");
         return CHDBError;
     }
     if (!name)

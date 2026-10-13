@@ -19,13 +19,20 @@ static struct mem_registration fence_registration;
 void registration_api_tests(const chdb_object_storage_callbacks * cb)
 {
     char err[512] = "";
+    chdb_object_storage_callbacks bad = *cb;
+    bad.version = CHDB_OBJECT_STORAGE_ABI_V1 + 1;
+    check(chdb_register_object_storage("mem_wrong_abi", &bad, err, sizeof(err)) == CHDBError
+            && strstr(err, "ABI mismatch"), "unsupported ABI is refused before reading the table");
+    bad.struct_size = CHDB_OBJECT_STORAGE_CALLBACKS_HEADER_SIZE;
+    err[0] = 0;
+    check(chdb_register_object_storage("mem_wrong_abi_short", &bad, err, sizeof(err)) == CHDBError
+            && strstr(err, "ABI mismatch"), "unsupported ABI is refused with only the fixed header present");
     check(chdb_register_object_storage("mem_null", NULL, err, sizeof(err)) == CHDBError && strstr(err, "NULL"),
         "a NULL table is refused with a reason");
     check(chdb_register_object_storage("", cb, NULL, 0) == CHDBError, "an empty name is refused");
 
-    /* struct_size below the engine's sizeof is a header/library mismatch; a larger struct is a newer
-     * caller whose extra fields are ignored (the engine copies only sizeof bytes). */
-    chdb_object_storage_callbacks bad = *cb;
+    /* V1 requires its original callback fields. Unknown fields after that prefix are ignored. */
+    bad = *cb;
     bad.struct_size = sizeof(bad) - 4;
     err[0] = 0;
     check(chdb_register_object_storage("mem_short", &bad, err, sizeof(err)) == CHDBError && strstr(err, "struct_size"),
@@ -82,6 +89,15 @@ void keyspace_tests(chdb_connection conn)
     mem_store_snapshot(&after);
     check(after.keyspace_opens == before.keyspace_opens, "the refused disk never opened its keyspace");
 
+    err[0] = 0;
+    free(run(conn,
+        "CREATE TABLE db.t_reader_overlap (k UInt64) ENGINE = MergeTree ORDER BY k"
+        " SETTINGS disk = disk(type = 'callback', storage_name = 'mem_store', key_prefix = 'main', read_only = 1)",
+        err, sizeof(err)));
+    check(strstr(err, "overlaps") != NULL, "an independent reader cannot overlap an open writer");
+    mem_store_snapshot(&after);
+    check(after.keyspace_opens == before.keyspace_opens, "the refused reader never opened its keyspace");
+
     /* The host's own gate: a keyspace another process holds refuses the disk with the host's reason. */
     pthread_mutex_lock(&store.lock);
     store.fail.open_keyspace = "locked";
@@ -97,6 +113,24 @@ void keyspace_tests(chdb_connection conn)
     check(strstr(err, "CALLBACK_OBJECT_STORAGE_ERROR") && strstr(err, "keyspace locked by another process"),
         "open_keyspace refuses a disk with the host's reason");
     check(mem_store_count_keys("locked/", NULL) == 0, "the refused disk wrote nothing");
+
+    mem_store_put("host_owned/live", "safe", 4);
+    pthread_mutex_lock(&store.lock);
+    store.fail.list_outside_prefix = 1;
+    pthread_mutex_unlock(&store.lock);
+    check(run_ok(conn,
+        "CREATE TABLE db.t_bad_list (k UInt64) ENGINE = MergeTree ORDER BY k"
+        " SETTINGS disk = disk(type = 'callback', storage_name = 'mem_store', key_prefix = 'bad_list')"),
+        "CREATE TABLE survives a refused scratch sweep");
+    pthread_mutex_lock(&store.lock);
+    store.fail.list_outside_prefix = 0;
+    pthread_mutex_unlock(&store.lock);
+    check(mem_store_has("host_owned/live"), "scratch sweep cannot delete a key outside its prefix");
+    check(run_ok(conn, "DROP TABLE db.t_bad_list SYNC"), "DROP the scratch sweep test table");
+    chdb_object_storage_callbacks cleanup;
+    mem_store_fill(&cleanup, NULL);
+    chdb_object_storage_call call = {sizeof(call), NULL, 0};
+    check(cleanup.remove(cleanup.ud, &call, "host_owned/live") == CHDB_OBJECT_STORAGE_OK, "remove the protected host test key");
 }
 
 /* A callback that calls back into chDB on the connection running the statement is refused instead of
@@ -113,15 +147,50 @@ void reentrancy_test(chdb_connection conn)
     pthread_mutex_lock(&store.lock);
     store.reenter_conn = conn;
     store.reenter_query_refused = store.reenter_unregister_refused = 0;
+    store.reenter_cmdline_refused = store.reenter_stable_refused = store.reenter_stable_v2_refused = 0;
     pthread_mutex_unlock(&store.lock);
     check(run_ok(conn, "INSERT INTO db.t_reenter SELECT number FROM numbers(10)"), "INSERT whose callback calls back into chDB");
     pthread_mutex_lock(&store.lock);
     int query_refused = store.reenter_query_refused, unregister_refused = store.reenter_unregister_refused;
+    int cmdline_refused = store.reenter_cmdline_refused;
+    int stable_refused = store.reenter_stable_refused;
+    int stable_v2_refused = store.reenter_stable_v2_refused;
     store.reenter_conn = NULL;
     pthread_mutex_unlock(&store.lock);
     check(query_refused, "chdb_query from a callback is refused");
     check(unregister_refused, "chdb_unregister_object_storage from a callback is refused");
+    check(cmdline_refused, "chdb_query_cmdline from a callback is refused");
+    check(stable_refused, "query_stable from a callback returns NULL");
+    check(stable_v2_refused, "query_stable_v2 from a callback returns an error");
     check(run_ok(conn, "DROP TABLE db.t_reenter SYNC"), "DROP the re-entrancy table");
+
+    check(run_ok(conn,
+        "CREATE TABLE db.t_destroy_reenter (k UInt64) ENGINE = MergeTree ORDER BY k"
+        " SETTINGS disk = disk(type = 'callback', storage_name = 'mem_store', key_prefix = 'destroy_reentry')"),
+        "CREATE TABLE for the active stream cleanup probe");
+    chdb_insert_stream stream = chdb_stream_insert(conn, "INSERT INTO db.t_destroy_reenter", "CSV");
+    if (chdb_stream_insert_error(stream))
+    {
+        check(0, "start the cleanup probe INSERT");
+        chdb_destroy_insert_stream(stream);
+        return;
+    }
+    pthread_mutex_lock(&store.lock);
+    store.reenter_stream = stream;
+    store.reenter_destroy_seen = 0;
+    pthread_mutex_unlock(&store.lock);
+    check(chdb_stream_append(stream, "1\n2\n3\n", 6) == CHDBSuccess, "append the cleanup probe rows");
+    chdb_result * done = chdb_stream_done(stream);
+    check(chdb_result_error(done) == NULL, "callback cleanup leaves the active INSERT usable");
+    chdb_destroy_query_result(done);
+    pthread_mutex_lock(&store.lock);
+    int destroy_seen = store.reenter_destroy_seen;
+    store.reenter_stream = NULL;
+    pthread_mutex_unlock(&store.lock);
+    check(destroy_seen, "the callback tried to destroy its active INSERT");
+    chdb_destroy_insert_stream(stream);
+    expect(conn, "cleanup probe committed every row", "SELECT count() FROM db.t_destroy_reenter", "3");
+    check(run_ok(conn, "DROP TABLE db.t_destroy_reenter SYNC"), "DROP the cleanup probe table");
 }
 
 /* Unregistering a store whose disk is open fences it: later operations fail without reaching the host. */

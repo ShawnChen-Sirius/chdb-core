@@ -18,6 +18,8 @@ fi
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 cd "$DIR"
 
+bash ./runObjectStorageHostTest.sh
+
 echo "Compile and link"
 # CHDB_TEST_UBSAN=1 builds the host store with UBSan, which catches contract slips such as a
 # memcpy from NULL.

@@ -7,6 +7,8 @@
 #include <Common/ObjectStorageKeyGenerator.h>
 #include <Common/logger_useful.h>
 
+#include <utility>
+
 namespace DB
 {
 
@@ -36,7 +38,7 @@ CallbackObjectStorage::CallbackObjectStorage(String disk_name_, String key_prefi
     , read_only(read_only_)
     , log(getLogger("CallbackObjectStorage(" + disk_name + ")"))
 {
-    ops->attachDisk(key_prefix, read_only);
+    claim_id = ops->attachDisk(key_prefix, read_only);
 }
 
 CallbackObjectStorage::~CallbackObjectStorage()
@@ -47,7 +49,7 @@ CallbackObjectStorage::~CallbackObjectStorage()
 void CallbackObjectStorage::detach() noexcept
 {
     if (!detached.exchange(true))
-        ops->detachDisk(key_prefix, read_only);
+        ops->detachDisk(claim_id);
 }
 
 bool CallbackObjectStorage::exists(const StoredObject & object) const
@@ -85,12 +87,20 @@ std::optional<ObjectMetadata> CallbackObjectStorage::tryGetObjectMetadata(const 
 std::unique_ptr<ReadBufferFromFileBase> CallbackObjectStorage::readObject( /// NOLINT
     const StoredObject & object,
     const ReadSettings & read_settings,
-    std::optional<size_t> read_hint,
+    std::optional<size_t> /* read_hint */,
     bool use_external_buffer,
     bool /* restrict_seek */) const
 {
+    /// read_hint is not a file length. Use the stored size or query metadata later if it is unknown.
+    std::optional<size_t> file_size;
+    if (object.bytes_size != StoredObject::UnknownSize)
+    {
+        if (!std::in_range<size_t>(object.bytes_size))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Callback object '{}' is too large for this platform", object.remote_path);
+        file_size = static_cast<size_t>(object.bytes_size);
+    }
     return std::make_unique<ReadBufferFromCallback>(
-        ops, object.remote_path, patchSettings(read_settings).remote_fs_settings.buffer_size, use_external_buffer, read_hint);
+        ops, object.remote_path, patchSettings(read_settings).remote_fs_settings.buffer_size, use_external_buffer, file_size);
 }
 
 std::unique_ptr<WriteBufferFromFileBase> CallbackObjectStorage::writeObject( /// NOLINT

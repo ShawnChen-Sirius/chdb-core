@@ -225,9 +225,7 @@ static int query(chdb_connection conn, const char * sql, const char * want)
 int main(void)
 {
     /* 1. Register the store, before any chdb_connect that may reopen tables on it. */
-    chdb_object_storage_callbacks cb;
-    memset(&cb, 0, sizeof(cb));
-    cb.struct_size = sizeof(cb);
+    chdb_object_storage_callbacks cb = chdb_object_storage_callbacks_init();
     cb.metadata = on_metadata;
     cb.read = on_read;
     cb.write_begin = on_write_begin;
