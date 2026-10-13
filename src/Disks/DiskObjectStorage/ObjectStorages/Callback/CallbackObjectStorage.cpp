@@ -38,7 +38,7 @@ CallbackObjectStorage::CallbackObjectStorage(String disk_name_, String key_prefi
     , read_only(read_only_)
     , log(getLogger("CallbackObjectStorage(" + disk_name + ")"))
 {
-    ops->attachDisk(key_prefix, read_only);
+    claim_id = ops->attachDisk(key_prefix, read_only);
 }
 
 CallbackObjectStorage::~CallbackObjectStorage()
@@ -49,7 +49,7 @@ CallbackObjectStorage::~CallbackObjectStorage()
 void CallbackObjectStorage::detach() noexcept
 {
     if (!detached.exchange(true))
-        ops->detachDisk(key_prefix, read_only);
+        ops->detachDisk(claim_id);
 }
 
 bool CallbackObjectStorage::exists(const StoredObject & object) const

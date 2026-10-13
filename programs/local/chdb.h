@@ -1197,11 +1197,10 @@ CHDB_EXPORT chdb_state chdb_shutdown(void);
  * per store and never change it for an existing store. With no prefix all
  * keys of the disk live at the store root next to __meta/ and __root/, so
  * keep host-owned blobs out of that namespace. A disk claims its whole
- * prefix: creating a second read-write disk on the same store whose prefix
- * overlaps one that is open (equal, one empty, or one a prefix of the other,
- * trailing '/' ignored) fails before the second disk reads or deletes any
- * key, so a host that wants several disks over one store gives every disk its
- * own prefix from the start.
+ * prefix. Independent disks may share overlapping prefixes only when both
+ * are read-only. Overlap means equal prefixes, an empty prefix, or one a
+ * prefix of the other (trailing '/' ignored). Conflicts fail before the new
+ * disk reads or deletes any key. Tables may reuse the same read-write disk.
  *
  * Status codes: every callback returns a chdb_object_storage_status, 0 on
  * success. CHDB_OBJECT_STORAGE_NOT_FOUND says a key does not exist: metadata

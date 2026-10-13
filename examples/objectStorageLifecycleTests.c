@@ -82,6 +82,15 @@ void keyspace_tests(chdb_connection conn)
     mem_store_snapshot(&after);
     check(after.keyspace_opens == before.keyspace_opens, "the refused disk never opened its keyspace");
 
+    err[0] = 0;
+    free(run(conn,
+        "CREATE TABLE db.t_reader_overlap (k UInt64) ENGINE = MergeTree ORDER BY k"
+        " SETTINGS disk = disk(type = 'callback', storage_name = 'mem_store', key_prefix = 'main', read_only = 1)",
+        err, sizeof(err)));
+    check(strstr(err, "overlaps") != NULL, "an independent reader cannot overlap an open writer");
+    mem_store_snapshot(&after);
+    check(after.keyspace_opens == before.keyspace_opens, "the refused reader never opened its keyspace");
+
     /* The host's own gate: a keyspace another process holds refuses the disk with the host's reason. */
     pthread_mutex_lock(&store.lock);
     store.fail.open_keyspace = "locked";

@@ -305,9 +305,9 @@ SETTINGS disk = disk(type = 'callback', storage_name = 'store', key_prefix = 'te
 - Choose the prefix once per keyspace and never change it for existing data.
 - Without a prefix, the disk's keys live at the store root next to `__meta/` and `__root/`; keep
   host-owned blobs out of that namespace.
-- A disk claims its whole prefix. A second read-write disk on the same store whose prefix overlaps an
-  open one (equal, empty, or one a prefix of the other; a trailing `/` is ignored, so `'a'` and
-  `'a/'` are the same keyspace) is refused when it is created, before it reads or deletes any key.
+- Independent disks may share overlapping prefixes only when both are read-only. Overlap means equal
+  prefixes, an empty prefix, or one a prefix of the other; trailing `/` is ignored. A conflict fails
+  before the new disk reads or deletes any key.
 - Tables that use exactly the same `disk(...)` arguments share one disk, which is fine.
 
 ## Several processes: open_keyspace and close_keyspace
@@ -364,9 +364,9 @@ SETTINGS disk = disk(type = 'callback', storage_name = 'store', read_only = 1);
 
 The disk loads the directory tree from the store when it opens, `open_keyspace` receives
 `CHDB_OBJECT_STORAGE_READ_ONLY`, reads work, and writes fail with `TABLE_IS_PERMANENTLY_READ_ONLY`.
-Read-only disks do not claim their keyspace, so inside one process several of them can share a
-prefix with each other and with one writer; across processes, your `open_keyspace` decides. They
-never write to the store, so they also skip the scratch sweep described in
+Read-only disks claim their keyspace and may share it with other readers, but not an independent
+writer. Across processes the host must enforce the same rule. Normal reads and writes through one
+read-write disk are unchanged. Read-only disks skip the scratch sweep described in
 [Crash recovery](#crash-recovery).
 
 ## What MergeTree can do on this disk

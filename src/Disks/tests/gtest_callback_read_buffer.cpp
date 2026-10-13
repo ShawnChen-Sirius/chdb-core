@@ -204,7 +204,7 @@ TEST(ReadBufferFromCallback, MetadataSizeMustFitPlatform)
 TEST(CallbackObjectStorageOps, OverlappingKeyspacesAreRefused)
 {
     auto [ops, host] = makeOps();
-    ops->claimKeyspace("a");
+    auto claim = ops->claimKeyspace("a");
     EXPECT_THROW(ops->claimKeyspace("a"), Exception);
     EXPECT_THROW(ops->claimKeyspace("a/"), Exception);
     EXPECT_THROW(ops->claimKeyspace("a/b"), Exception);
@@ -212,7 +212,7 @@ TEST(CallbackObjectStorageOps, OverlappingKeyspacesAreRefused)
     EXPECT_THROW(ops->claimKeyspace(""), Exception);
     ops->claimKeyspace("b");
 
-    ops->releaseKeyspace("a/");
+    ops->releaseKeyspace(claim);
     ops->claimKeyspace("a/b");
     EXPECT_THROW(ops->claimKeyspace("a"), Exception);
 }

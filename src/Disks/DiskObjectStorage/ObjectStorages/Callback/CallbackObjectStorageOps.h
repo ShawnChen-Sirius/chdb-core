@@ -22,8 +22,7 @@ namespace DB
 ///   a chdb_* call from a callback instead of deadlocking on the connection mutex.
 /// - Errors: host failures become CALLBACK_OBJECT_STORAGE_ERROR naming the store, the operation, the key
 ///   and the host's message; a C++ exception escaping the host is reported the same way.
-/// - Keyspaces: attachDisk() gives one read-write disk exclusive use of a key prefix in this process and
-///   lets the host gate it across processes.
+/// - Keyspaces: readers may share a prefix; writers exclude other disks. Hosts handle cross-process access.
 class CallbackObjectStorageOps
 {
 public:
@@ -49,19 +48,15 @@ public:
     bool hasCopy() const { return host->hasCopy(); }
     void copy(const String & from_key, const String & to_key) const;
 
-    /// Opens a disk on key_prefix: a read-write disk claims the keyspace (see claimKeyspace), then the
-    /// host's open_keyspace hook runs. detachDisk() undoes both and must follow every successful attach.
-    void attachDisk(const String & key_prefix, bool read_only);
-    void detachDisk(const String & key_prefix, bool read_only) noexcept;
-    /// Disks attached and not yet detached. A disk is detached when it shuts down, which is when the
-    /// last connection closes, even if something still references the object afterwards.
+    /// Reserves the prefix before calling the host. Detach the returned claim once the disk closes.
+    uint64_t attachDisk(const String & key_prefix, bool read_only);
+    void detachDisk(uint64_t claim_id) noexcept;
+    /// Includes disks being opened or closed.
     bool hasAttachedDisks() const;
 
-    /// Throws BAD_ARGUMENTS when a live read-write disk of this store already holds an overlapping prefix
-    /// (equal, empty, or one a prefix of the other once trailing '/' are dropped). Released by
-    /// releaseKeyspace(); a store can run one plain_rewritable writer per keyspace.
-    void claimKeyspace(const String & key_prefix);
-    void releaseKeyspace(const String & key_prefix) noexcept;
+    /// Overlapping prefixes are allowed only when both disks are read-only.
+    uint64_t claimKeyspace(const String & key_prefix, bool read_only = false);
+    void releaseKeyspace(uint64_t claim_id) noexcept;
 
     /// Refuses every later call and waits for the calls in flight to return. Idempotent.
     void fence();
@@ -90,8 +85,15 @@ private:
     mutable std::condition_variable drained;
     mutable size_t in_flight = 0;
     bool fenced = false;
-    std::vector<String> claimed_keyspaces;
-    size_t attached_disks = 0;
+    struct KeyspaceClaim
+    {
+        uint64_t id;
+        String prefix;
+        bool read_only;
+        bool closing = false;
+    };
+    std::vector<std::shared_ptr<KeyspaceClaim>> claimed_keyspaces;
+    uint64_t next_claim_id = 1;
 };
 
 using CallbackObjectStorageOpsPtr = std::shared_ptr<CallbackObjectStorageOps>;

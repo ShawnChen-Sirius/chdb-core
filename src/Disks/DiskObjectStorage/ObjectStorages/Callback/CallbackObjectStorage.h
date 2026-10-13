@@ -80,6 +80,7 @@ private:
     const CallbackObjectStorageOpsPtr ops;
     const bool read_only;
     const LoggerPtr log;
+    uint64_t claim_id = 0;
     std::atomic<bool> detached = false;
 };
 
