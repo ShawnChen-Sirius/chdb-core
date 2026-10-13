@@ -7,6 +7,8 @@
 #include <Common/ObjectStorageKeyGenerator.h>
 #include <Common/logger_useful.h>
 
+#include <utility>
+
 namespace DB
 {
 
@@ -85,12 +87,19 @@ std::optional<ObjectMetadata> CallbackObjectStorage::tryGetObjectMetadata(const 
 std::unique_ptr<ReadBufferFromFileBase> CallbackObjectStorage::readObject( /// NOLINT
     const StoredObject & object,
     const ReadSettings & read_settings,
-    std::optional<size_t> read_hint,
+    std::optional<size_t> /* read_hint */,
     bool use_external_buffer,
     bool /* restrict_seek */) const
 {
+    std::optional<size_t> file_size;
+    if (object.bytes_size != StoredObject::UnknownSize)
+    {
+        if (!std::in_range<size_t>(object.bytes_size))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Callback object '{}' is too large for this platform", object.remote_path);
+        file_size = static_cast<size_t>(object.bytes_size);
+    }
     return std::make_unique<ReadBufferFromCallback>(
-        ops, object.remote_path, patchSettings(read_settings).remote_fs_settings.buffer_size, use_external_buffer, read_hint);
+        ops, object.remote_path, patchSettings(read_settings).remote_fs_settings.buffer_size, use_external_buffer, file_size);
 }
 
 std::unique_ptr<WriteBufferFromFileBase> CallbackObjectStorage::writeObject( /// NOLINT

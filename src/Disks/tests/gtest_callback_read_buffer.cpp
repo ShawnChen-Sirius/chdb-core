@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/ObjectStorages/Callback/ReadBufferFromCallback.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/Callback/CallbackObjectStorage.h>
 
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -20,13 +22,14 @@ public:
     std::map<String, std::string> blobs;
     /// When nonzero, every read returns at most this many bytes.
     size_t max_read = 0;
+    std::optional<uint64_t> metadata_size;
 
     Status metadata(const char * key, CallbackObjectStat & stat, String &) override
     {
         auto it = blobs.find(key);
         if (it == blobs.end())
             return Status::NotFound;
-        stat.size = it->second.size();
+        stat.size = metadata_size.value_or(it->second.size());
         return Status::Ok;
     }
 
@@ -39,10 +42,11 @@ public:
             return Status::NotFound;
         }
         const auto & data = it->second;
-        bytes_read = offset >= data.size() ? 0 : std::min(len, data.size() - offset);
+        bytes_read = offset >= data.size() ? 0 : std::min(len, data.size() - static_cast<size_t>(offset));
         if (max_read)
             bytes_read = std::min(bytes_read, max_read);
-        memcpy(buf, data.data() + offset, bytes_read);
+        if (bytes_read)
+            memcpy(buf, data.data() + offset, bytes_read);
         return Status::Ok;
     }
 
@@ -150,6 +154,49 @@ TEST(ReadBufferFromCallback, ShortReadsAreNotEof)
     ReadBufferFromCallback in(ops, "blob", /*buf_size=*/64, /*use_external_buffer_=*/false, /*file_size_=*/std::nullopt);
 
     EXPECT_EQ(readAll(in), host->blobs["blob"]);
+}
+
+TEST(CallbackObjectStorage, ReadHintDoesNotChangeFileSize)
+{
+    for (size_t hint : {size_t(1), size_t(4096)})
+    {
+        auto [ops, host] = makeOps();
+        host->blobs["blob"] = pattern(1000);
+        CallbackObjectStorage storage("gtest", "", ops, false);
+        ReadSettings settings;
+        settings.remote_fs_settings.buffer_size = 64;
+        auto in = storage.readObject(StoredObject("blob", "", 1000), settings, hint);
+        EXPECT_EQ(in->tryGetFileSize(), 1000);
+        EXPECT_EQ(readAll(*in), host->blobs["blob"]);
+    }
+}
+
+TEST(CallbackObjectStorage, UnknownAndEmptyFileSizes)
+{
+    auto [ops, host] = makeOps();
+    host->blobs["blob"] = pattern(100);
+    host->blobs["empty"] = "";
+    CallbackObjectStorage storage("gtest", "", ops, false);
+    ReadSettings settings;
+    settings.remote_fs_settings.buffer_size = 64;
+    auto unknown = storage.readObject(StoredObject("blob"), settings, 1);
+    EXPECT_EQ(unknown->tryGetFileSize(), 100);
+    EXPECT_EQ(readAll(*unknown), host->blobs["blob"]);
+    auto empty = storage.readObject(StoredObject("empty", "", 0), settings, 100);
+    EXPECT_EQ(empty->tryGetFileSize(), 0);
+    EXPECT_TRUE(readAll(*empty).empty());
+}
+
+TEST(ReadBufferFromCallback, MetadataSizeMustFitPlatform)
+{
+    auto [ops, host] = makeOps();
+    host->blobs["blob"] = "x";
+    host->metadata_size = std::numeric_limits<uint64_t>::max() - 1;
+    ReadBufferFromCallback in(ops, "blob", 64, false, std::nullopt);
+    if constexpr (sizeof(size_t) < sizeof(uint64_t))
+        EXPECT_THROW(in.tryGetFileSize(), Exception);
+    else
+        EXPECT_EQ(in.tryGetFileSize(), *host->metadata_size);
 }
 
 /// One read-write disk per keyspace: equal, nested and empty prefixes overlap; trailing '/' is ignored.

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <utility>
 #include <Disks/DiskObjectStorage/ObjectStorages/Callback/CallbackObjectStorageOps.h>
 #include <IO/ReadBufferFromFileBase.h>
 #include <Common/Exception.h>
@@ -11,6 +12,7 @@ namespace DB
 
 namespace ErrorCodes
 {
+    extern const int BAD_ARGUMENTS;
     extern const int CANNOT_SEEK_THROUGH_FILE;
     extern const int FILE_DOESNT_EXIST;
 }
@@ -49,7 +51,9 @@ public:
             auto stat = ops->stat(key);
             if (!stat)
                 throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "Callback object '{}' does not exist", key);
-            file_size = stat->size;
+            if (!std::in_range<size_t>(stat->size))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Callback object '{}' is too large for this platform", key);
+            file_size = static_cast<size_t>(stat->size);
         }
         return file_size;
     }
