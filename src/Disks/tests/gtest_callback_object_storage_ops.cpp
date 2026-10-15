@@ -158,23 +158,32 @@ TEST(CallbackObjectStorageOps, ListCapturesSinkErrors)
     EXPECT_THROW(ops->list("main/", [](const char *, uint64_t, int64_t) { return false; }), Exception);
 }
 
-TEST(CallbackObjectStorageOps, ReadersShareButWritersDoNot)
+TEST(CallbackObjectStorageOps, ReadersCanOverlapWriterButWritersDoNotOverlap)
 {
     auto [ops, host] = makeTestOps();
+    std::vector<bool> opened_read_only;
+    host->opening = [&](const char *, bool read_only, String &)
+    {
+        opened_read_only.push_back(read_only);
+        return TestHost::Status::Ok;
+    };
     auto reader1 = ops->attachDisk("main", true);
     auto reader2 = ops->attachDisk("main/", true);
-    EXPECT_THROW(ops->attachDisk("main", false), Exception);
-    ops->detachDisk(reader1);
-    ops->detachDisk(reader1);
-    EXPECT_THROW(ops->attachDisk("main", false), Exception);
-    ops->detachDisk(reader2);
-    EXPECT_FALSE(ops->hasAttachedDisks());
     auto writer = ops->attachDisk("main", false);
-    EXPECT_THROW(ops->attachDisk("main/", true), Exception);
     EXPECT_THROW(ops->attachDisk("main/child", false), Exception);
+    ops->detachDisk(reader1);
+    ops->detachDisk(reader1);
+    EXPECT_THROW(ops->attachDisk("main", false), Exception);
+    auto reader3 = ops->attachDisk("main/child", true);
+    ops->detachDisk(reader2);
     auto independent = ops->attachDisk("other", false);
     ops->detachDisk(independent);
     ops->detachDisk(writer);
+    auto replacement = ops->attachDisk("main", false);
+    ops->detachDisk(replacement);
+    ops->detachDisk(reader3);
+    EXPECT_FALSE(ops->hasAttachedDisks());
+    EXPECT_EQ(opened_read_only, (std::vector<bool>{true, true, false, true, false, false}));
 }
 
 TEST(CallbackObjectStorageOps, FailedOpenReleasesClaim)
@@ -198,11 +207,12 @@ TEST(CallbackObjectStorageOps, FailedOpenReleasesClaim)
         return TestHost::Status::Ok;
     };
     auto writer = ops->attachDisk("main/", false);
-    EXPECT_THROW(ops->attachDisk("main", true), Exception);
-    EXPECT_EQ(opens, 2);
+    auto reader = ops->attachDisk("main", true);
+    EXPECT_EQ(opens, 3);
+    ops->detachDisk(reader);
     ops->detachDisk(writer);
     ops->detachDisk(writer);
-    EXPECT_EQ(closes, 1);
+    EXPECT_EQ(closes, 2);
 }
 
 TEST(CallbackObjectStorageOps, ClosingKeepsClaimUntilHostReturns)

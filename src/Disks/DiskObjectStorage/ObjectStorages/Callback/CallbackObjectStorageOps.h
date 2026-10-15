@@ -22,7 +22,7 @@ namespace DB
 ///   a chdb_* call from a callback instead of deadlocking on the connection mutex.
 /// - Errors: host failures become CALLBACK_OBJECT_STORAGE_ERROR naming the store, the operation, the key
 ///   and the host's message; a C++ exception escaping the host is reported the same way.
-/// - Keyspaces: readers may share a prefix; writers exclude other disks. Hosts handle cross-process access.
+/// - Keyspaces: independent readers may overlap a writer; a second writer is refused. Hosts handle cross-process access.
 class CallbackObjectStorageOps
 {
 public:
@@ -54,7 +54,7 @@ public:
     /// Includes claims held while the host opens or closes a disk.
     bool hasAttachedDisks() const;
 
-    /// Overlapping prefixes are allowed only when both disks are read-only.
+    /// Only independent read-write disks with overlapping prefixes conflict.
     uint64_t claimKeyspace(const String & key_prefix, bool read_only = false);
     void releaseKeyspace(uint64_t claim_id) noexcept;
 
