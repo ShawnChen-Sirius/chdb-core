@@ -492,7 +492,7 @@ static int cb_list(void * ud, chdb_object_storage_call * call, const char * pref
 
 typedef struct { void * ud; chdb_object_storage_call * call; const char * prefix; uint32_t flags; } keyspace_args;
 
-/* A real host would take a cross-process lock here (exclusive unless CHDB_OBJECT_STORAGE_READ_ONLY). */
+/* A shared host must reject a second writer without keeping readers out. */
 static int do_open_keyspace(void * p)
 {
     keyspace_args * a = p;

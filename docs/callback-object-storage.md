@@ -340,9 +340,9 @@ SETTINGS disk = disk(type = 'callback', storage_name = 'store', key_prefix = 'te
 - Choose the prefix once per keyspace and never change it for existing data.
 - Without a prefix, the disk's keys live at the store root next to `__meta/` and `__root/`; keep
   host-owned blobs out of that namespace.
-- Independent disks may share overlapping prefixes only when both are read-only. Overlap means equal
-  prefixes, an empty prefix, or one a prefix of the other; trailing `/` is ignored. A conflict fails
-  before the new disk reads or deletes any key.
+- Read-only disks can use a writer's prefix. A second read-write disk cannot use an overlapping
+  prefix (equal, empty, or one a prefix of the other; trailing `/` is ignored). It fails before
+  reading or deleting any key.
 - Tables that use exactly the same `disk(...)` arguments share one disk, which is fine.
 
 ## Several processes: open_keyspace and close_keyspace
@@ -359,33 +359,19 @@ store, as every PostgreSQL backend can, the host must keep a second writer out, 
 - `close_keyspace(prefix)` is called once when that disk shuts down, at the last connection close,
   unless the registration was fenced first.
 
-A sketch with `flock(2)`, one lock file per keyspace (exclusive for writers, shared for readers):
+A writer can stay attached between flushes. Holding an exclusive lock against readers for that
+whole time would keep them from opening the index. The host can instead use `open_keyspace` to
+lock out a second writer while admitting readers. In PostgreSQL, take that lock on the main thread
+(see [Threads](#threads)).
 
-```c
-static int on_open_keyspace(void * ud, chdb_object_storage_call * call,
-                            const char * key_prefix, uint32_t flags)
-{
-    struct host * h = ud;
-    int fd = open_lock_file(h, key_prefix);            /* host-specific */
-    int mode = (flags & CHDB_OBJECT_STORAGE_READ_ONLY) ? LOCK_SH : LOCK_EX;
-    if (fd < 0 || flock(fd, mode | LOCK_NB) != 0)
-    {
-        snprintf(call->error, call->error_size, "keyspace '%s' is in use by another process", key_prefix);
-        if (fd >= 0)
-            close(fd);
-        return CHDB_OBJECT_STORAGE_ERROR;
-    }
-    remember_lock(h, key_prefix, fd);                  /* host-specific */
-    return CHDB_OBJECT_STORAGE_OK;
-}
+`close_keyspace` receives only the prefix, with no read-only flag or claim ID. If a registration
+opens a reader and writer on the same prefix, a reader's close must not release the writer's lock.
+Track ownership separately, for example by keeping each registration to one role.
 
-static void on_close_keyspace(void * ud, const char * key_prefix)
-{
-    close(forget_lock(ud, key_prefix));                /* releases the flock */
-}
-```
-
-A PostgreSQL host would take an advisory lock instead, from its main thread (see [Threads](#threads)).
+Concurrent readers need more than a single-writer lock. The host must keep old parts available
+while a reader uses them ([ClickHouse #124083](https://github.com/ClickHouse/ClickHouse/issues/124083))
+and refresh metadata across processes. Test a long-lived writer with several readers while it
+flushes and merges parts.
 
 ## Read-only disks
 
@@ -401,10 +387,9 @@ The disk loads the directory tree from the store when it opens, and `open_keyspa
 `CHDB_OBJECT_STORAGE_READ_ONLY`. The read-only disk wrapper rejects ordinary write operations;
 the integration test checks that `INSERT` fails. This is not a write barrier at the callback layer:
 the wrapper currently delegates `createTransaction()` and `writeFileUsingBlobWritingFunction()` to
-the underlying disk, and callback `writeObject()` does not check `read_only`. A host using shared
-reader locks must also prevent writes through any lower-level path it exposes.
-Read-only disks claim their keyspace and may share it with other readers, but not an independent
-writer. Across processes the host must enforce the same rule. Normal reads and writes through one
+the underlying disk, and callback `writeObject()` does not check `read_only`. Read-only disks may
+share a keyspace with other readers and one writer. The host must stop writes through those
+lower-level paths as well. Normal reads and writes through one
 read-write disk are unchanged. Read-only disks skip the scratch sweep described in
 [Crash recovery](#crash-recovery).
 
@@ -488,6 +473,7 @@ Before shipping a host, check it against this list:
 - [ ] Never reenters the engine from a callback or waits for the thread inside `chdb_*`.
 - [ ] Writes failure messages into `call->error`, not into thread-local state.
 - [ ] Registers before `chdb_connect`, and unregisters from its exit hook before freeing the store.
-- [ ] Keeps independently opened writers off overlapping prefixes; only independent readers may
-      share one. Locks keyspaces across processes in `open_keyspace` if more than one process can
-      open the store.
+- [ ] Keeps independently opened writers off overlapping prefixes across processes in
+      `open_keyspace`, without excluding readers for the writer's whole lifetime.
+- [ ] Protects old parts in use, refreshes metadata across processes, blocks writes from read-only disks,
+      and tests a long-lived writer with multiple readers and periodic flushes and merges.

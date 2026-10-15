@@ -297,15 +297,13 @@ uint64_t CallbackObjectStorageOps::claimKeyspace(const String & key_prefix, bool
     for (const auto & claimed : claimed_keyspaces)
     {
         const auto existing = normalizeKeyspace(claimed->prefix);
-        if ((!read_only || !claimed->read_only) && (keyspace.starts_with(existing) || existing.starts_with(keyspace)))
+        if (!read_only && !claimed->read_only && (keyspace.starts_with(existing) || existing.starts_with(keyspace)))
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
-                "Callback object storage '{}': {} disk with key_prefix '{}' overlaps {} disk with key_prefix '{}'. "
-                "Only read-only disks may share overlapping prefixes; reuse the existing disk or choose a separate prefix",
+                "Callback object storage '{}': read-write disk with key_prefix '{}' overlaps read-write disk with key_prefix '{}'. "
+                "Reuse the existing disk or choose a separate prefix",
                 name,
-                read_only ? "read-only" : "read-write",
                 key_prefix,
-                claimed->read_only ? "read-only" : "read-write",
                 claimed->prefix);
     }
     const auto claim_id = next_claim_id++;

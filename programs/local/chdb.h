@@ -1196,11 +1196,11 @@ CHDB_EXPORT chdb_state chdb_shutdown(void);
  * like <key_prefix>/__meta/... and <key_prefix>/<dir>/<file>; choose it once
  * per store and never change it for an existing store. With no prefix all
  * keys of the disk live at the store root next to __meta/ and __root/, so
- * keep host-owned blobs out of that namespace. A disk claims its whole
- * prefix. Independent disks may share overlapping prefixes only when both
- * are read-only. Overlap means equal prefixes, an empty prefix, or one a
- * prefix of the other (trailing '/' ignored). Conflicts fail before the new
- * disk reads or deletes any key. Tables may reuse the same read-write disk.
+ * keep host-owned blobs out of that namespace. Independent read-only disks
+ * may overlap a read-write disk; two read-write disks with overlapping
+ * prefixes (equal, empty, or one a prefix of the other, trailing '/' ignored)
+ * conflict before the new disk reads or deletes any key. Tables may reuse
+ * the same disk.
  *
  * Status codes: every callback returns a chdb_object_storage_status, 0 on
  * success. CHDB_OBJECT_STORAGE_NOT_FOUND says a key does not exist: metadata
@@ -1268,8 +1268,15 @@ CHDB_EXPORT chdb_state chdb_shutdown(void);
  * chdb_connect returns NULL when it reopens such a table). It calls
  * close_keyspace once when the disk shuts down (when the last connection
  * closes), unless the registration was fenced first. A host whose store is
- * shared by several processes (each PostgreSQL backend is one) takes a lock
- * there: exclusive for writers, shared for readers.
+ * shared by several processes (each PostgreSQL backend is one) must exclude
+ * other writers there while admitting readers. A writer may stay attached
+ * between flushes; a lifetime lock against readers would keep them out.
+ * The host must keep old parts available to active readers
+ * (ClickHouse/ClickHouse#124083), refresh metadata across processes and stop
+ * writes from read-only disks on every path. Test a long-lived writer with
+ * several readers and periodic flushes and merges. close_keyspace gets only
+ * the prefix, not the flags or an attachment ID. A reader's close must not
+ * release a writer's lock on the same prefix.
  *
  * Visibility: write_commit makes the blob visible atomically; a blob that was
  * never committed or was aborted must not be visible to metadata/read/list.
